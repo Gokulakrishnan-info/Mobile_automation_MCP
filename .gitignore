@@ -1,0 +1,44 @@
+# OS / Editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Virtual environments & secret config
+.env
+.env.*
+*.env
+env/
+Env/
+ENV/
+venv/
+.venv/
+.python-version
+
+# Node / Bun installs
+node_modules/
+frontend/prompt-bot-suite-main/node_modules/
+backend/appium-mcp/node_modules/
+bun.lockb
+
+# App output
+backend/reports/
+backend/appium-mcp/screenshots/
+
+# Logs & temp files
+*.log
+logs/
+tmp/
+temp/
+
+

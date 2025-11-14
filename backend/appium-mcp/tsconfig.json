@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    /* Language and Environment */
+    "target": "ESNext",                                  /* Use latest JS features for modern Node environments */
+    "module": "NodeNext",                                /* ESM-compatible module output for ts-node/esm */
+    "moduleResolution": "NodeNext",                      /* Proper resolution for NodeNext imports */
+    "esModuleInterop": true,                             /* Allow default imports from CommonJS modules */
+    "resolveJsonModule": true,                           /* Enable importing JSON files */
+    "strict": true,                                      /* Enable all strict type-checking options */
+    "skipLibCheck": true,                                /* Skip type checking of declaration files */
+    "forceConsistentCasingInFileNames": true,            /* Enforce consistent import casing */
+    "isolatedModules": true,                             /* Ensure each file is treated as its own module */
+    "allowSyntheticDefaultImports": true,                /* Allow default imports for CommonJS modules */
+    "noEmitOnError": false,                              /* Still emit JS even if there are TS errors (optional) */
+    "outDir": "./dist",                                  /* Output directory for compiled JS files */
+
+    /* Path and Base Directory */
+    "baseUrl": "./src",                                  /* Base directory for module resolution */
+    "paths": {
+      "*": ["./*"]                                       /* Allow shorthand imports within src folder */
+    }
+  },
+
+  /* Include project files */
+  "include": ["src/**/*.ts"],
+
+  /* Exclude test and dependency directories */
+  "exclude": ["node_modules", "**/*.test.ts"]
+}
