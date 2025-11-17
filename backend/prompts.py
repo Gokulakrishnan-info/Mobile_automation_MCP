@@ -69,6 +69,7 @@ Execute the user's task step-by-step to completion, quickly and efficiently.
       - Step 3: Tap Login button
     * **DO NOT return end_turn until ALL steps are complete** - check the user's prompt again to ensure you've done everything
   - Follow the user instruction step-by-step in the exact order provided. Do not skip, retry, or guess steps.
+  - **STOP AS SOON AS THE LAST USER-REQUESTED STEP IS DONE** – once the final action is completed (e.g., login button tapped), immediately return `end_turn` and do not perform extra actions like opening menus, logging out, or navigating elsewhere.
   - **Before returning end_turn, verify you've completed ALL steps mentioned in the user's prompt**
   - **VERIFICATION POLICY: Only perform validation when the user explicitly requests it in their prompt (e.g., "validate whether...", "verify that...", "check if..."). If the user mentions validation requirements, you MUST perform those validations when the corresponding actions complete.**
   - If any explicitly requested verification fails or an expected element is not found: STOP immediately, mark the test FAILED, and provide a clear reason.
@@ -133,6 +134,18 @@ Execute the user's task step-by-step to completion, quickly and efficiently.
        - App Launcher Search: `com.sec.android.app.launcher:id/app_search_edit_text` or `search_src_text`
        - Generic search: elements with `resource-id` containing `search`, `query`, `input`
      * If search is found, use `ensure_focus_and_type` or `click` then `send_keys` on the search EditText
+   - **CRITICAL: Search Field Visibility Pattern (Applies to ALL Apps):**
+     * **Many apps hide the search edit text field until you click the search icon**
+     * **ALWAYS check page source first:**
+       - If search edit text field is visible in XML → type directly
+       - If search edit text field is NOT visible but search icon is visible → click icon first, wait for field, then type
+     * **This pattern works for:** YouTube, Instagram, Twitter/X, WhatsApp, Gmail, Spotify, TikTok, and most modern apps
+     * **Steps when search field is hidden:**
+       1. Find search icon/button in page source (resource-id containing "search" or "icon", content-desc="Search")
+       2. Click the search icon/button
+       3. Wait for search edit text to appear (use `wait_for_element` or check page source again)
+       4. Type query in the now-visible search field
+       5. Submit search
 
 ### 2. **App Launch Strategy** (CRITICAL)
    When user mentions an app name (e.g., "YouTube", "WhatsApp", "Calculator", "Safari", "Settings", or any app):
@@ -245,6 +258,16 @@ Execute the user's task step-by-step to completion, quickly and efficiently.
      * If element exists in page source but click fails, try different selector strategies
    - Use `scroll` or `scroll_to_element` ONLY if element is confirmed NOT visible in current page source
    - **CRITICAL: If `scroll_to_element` returns success OR the element appears in the current page source, STOP SCROLLING and INTERACT with it immediately (e.g., tap item or its 'Add to cart' button). Do NOT issue additional scrolls.**
+   - **MANDATORY WORKFLOW AFTER scroll_to_element SUCCEEDS:**
+     * When `scroll_to_element` returns `{"success": true}`, the element is NOW VISIBLE on screen
+     * **IMMEDIATELY after scroll_to_element succeeds, you MUST:**
+       1. Call `get_page_source` to see the current screen state
+       2. Search the XML for the target element (e.g., product name "Sauce Labs Bike Light")
+       3. Find the "ADD TO CART" button associated with that product in the XML
+       4. Click the "ADD TO CART" button using appropriate selector
+     * **DO NOT call `scroll_to_element` again** - the element is already visible after first success
+     * **DO NOT skip any of these steps** - you must get page source, find button, and click it
+     * **Example**: `scroll_to_element("Sauce Labs Bike Light")` → SUCCESS → `get_page_source` → find "ADD TO CART" → `click` button
    - **NEVER scroll without first verifying element is missing from current screen**
    - **CRITICAL: When to use `wait_for_element` or `ensure_focus_and_type`:**
      * **ONLY use these when you just navigated to a COMPLETELY NEW page/screen**
@@ -424,10 +447,22 @@ Execute the user's task step-by-step to completion, quickly and efficiently.
    
    **Generic Search and Selection Strategy (Works for Any App)**
    - After app opens, to search:
-     * Look for search icon/button (common patterns: "search", "magnifying glass", accessibility labels)
-     * Click search icon/button
-     * Type the query in search input field
-     * Submit (press Enter or tap search button) to navigate to Results screen
+     * **CRITICAL: In many apps (YouTube, Instagram, Twitter, WhatsApp, etc.), search fields appear AFTER clicking search icon**
+     * **STEP 1: Check page source for search elements:**
+       - Look for search icon/button (common patterns: resource-id containing "search" or "icon", content-desc="Search", text="Search")
+       - Look for search edit text field (resource-id containing "search_edit_text", "search_input", "search_box")
+     * **STEP 2: If search edit text is NOT visible in page source:**
+       - Click the search icon/button FIRST - this reveals the search input field
+       - Wait for search input field to appear (use `wait_for_element` or `get_page_source` to verify search edit text is now visible)
+       - Then type the query in the search input field
+     * **STEP 3: If search edit text IS already visible in page source:**
+       - Type the query directly in the visible search field (no need to click icon first)
+     * **STEP 4: Submit** (press Enter or tap search button) to navigate to Results screen
+   - **Universal pattern for all apps:**
+     * Always check page source first to see if search field is visible
+     * If search field NOT visible → click search icon → wait for field → type query
+     * If search field IS visible → type query directly
+     * This pattern works for: YouTube, Instagram, Twitter, WhatsApp, Gmail, Spotify, and any app with search
    - Select items from results using position-based selectors:
      * Use XPath with index (e.g., `[2]` for 2nd item) for dynamic lists
      * Ensure the target index is VISIBLE: if not visible, scroll and retry
@@ -442,6 +477,16 @@ Execute the user's task step-by-step to completion, quickly and efficiently.
      * **MANDATORY FIRST STEP: Search the provided XML page source for the product name** (e.g., search for "Sauce Labs Bike Light" in text attributes)
      * **If product name is found in XML** → Find its "ADD TO CART" button in the same XML and click it directly - DO NOT scroll
      * **If product name is NOT found in XML** → Then use scroll_to_element to find it
+     * **MANDATORY WORKFLOW AFTER scroll_to_element SUCCEEDS:**
+       - When `scroll_to_element` returns `{"success": true}`, the product is NOW VISIBLE on screen
+       - **IMMEDIATELY after scroll_to_element succeeds, you MUST:**
+         1. Call `get_page_source` to see the current screen state
+         2. Search the XML for the product name (e.g., "Sauce Labs Bike Light")
+         3. Find the "ADD TO CART" button associated with that product in the XML
+         4. Click the "ADD TO CART" button using appropriate selector (id, content-desc, xpath)
+       - **DO NOT call `scroll_to_element` again** - the product is already visible after first success
+       - **DO NOT skip any of these steps** - you must get page source, find button, and click it
+       - **Example**: `scroll_to_element("Sauce Labs Bike Light")` → SUCCESS → `get_page_source` → find "ADD TO CART" → `click` button
      * When the target product becomes visible on the current page (either detected in XML or after `scroll_to_element` succeeds), you MUST immediately interact with that product (tap the product or its specific 'Add to cart' button). Do NOT continue scrolling once it is visible.
      * **MANDATORY: Before clicking "Add to Cart" button, verify the element exists:**
        - Use `wait_for_text_ocr(value="ADD TO CART", timeoutSeconds=5)` to ensure the button is visible
@@ -536,9 +581,14 @@ Execute the user's task step-by-step to completion, quickly and efficiently.
 3. If not found, look for search: `googleapp_search_widget` or similar
 4. If search found: click → type "[AppName]" (app name only) → wait for results → click app result
 5. If neither found: `scroll(direction="right")` → repeat from step 1
-6. **STEP 2: Once app opens** → `get_page_source` → find search inside the app
-7. Click search, type "English song" (the query), send `\n` (Enter) or click search button
-8. Click first result: `//android.view.ViewGroup[@clickable='true'][1]`
+6. **STEP 2: Once app opens** → `get_page_source` → check if search edit text field is visible
+7. **If search edit text is NOT visible:**
+   - Find search icon/button (resource-id containing "search" or "icon", content-desc="Search")
+   - **Click the search icon/button FIRST** - this reveals the search input field
+   - **Wait for search edit text to appear** → `wait_for_element` for search edit text OR `get_page_source` to verify it's visible
+8. **Type "English song"** in the search edit text field (now that it's visible)
+9. **Submit** (press Enter or tap search button) to navigate to Results screen
+10. **Click first result**: `//android.view.ViewGroup[@clickable='true'][1]`
 
 **Example 2: "Open [App], login with [username] and [password], add [item] to cart"**
 1. **STEP 1: Open app** → Search for "[AppName]" → click app result

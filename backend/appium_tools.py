@@ -7,6 +7,7 @@ These functions wrap HTTP requests to the Appium MCP server.
 import requests
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
 
 # Load URL from environment, with a default
@@ -44,21 +45,129 @@ def initialize_appium_session(capabilities: dict = None):
         return None
 
 
+def _is_session_crashed_error(error_msg: str) -> bool:
+    """Check if error indicates session crash."""
+    if not error_msg:
+        return False
+    error_lower = error_msg.lower()
+    crash_indicators = [
+        'instrumentation process is not running',
+        'cannot be proxied to uiautomator2',
+        'probably crashed',
+        'session.*crashed',
+        'instrumentation.*crashed'
+    ]
+    return any(indicator in error_lower for indicator in crash_indicators)
+
+
+def _try_recover_session() -> bool:
+    """Attempt to recover crashed session by reinitializing."""
+    try:
+        print("\n--- [RECOVERY] Detected session crash. Attempting to recover...")
+        # Detect device type
+        device_type = "Android"
+        automation_name = "UiAutomator2"
+        
+        try:
+            import subprocess
+            adb_result = subprocess.run(
+                ["adb", "devices"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if adb_result.returncode == 0 and "device" in adb_result.stdout:
+                device_type = "Android"
+                automation_name = "UiAutomator2"
+                print("--- [INFO] Android device detected for recovery")
+        except:
+            pass
+        
+        default_capabilities = {
+            "platformName": device_type,
+            "appium:automationName": automation_name,
+            "appium:noReset": True,
+        }
+        
+        session_id = initialize_appium_session(default_capabilities)
+        if session_id:
+            print(f"--- [OK] Session recovered: {session_id}")
+            return True
+        else:
+            print("--- [ERROR] Failed to recover session")
+            return False
+    except Exception as e:
+        print(f"--- [ERROR] Session recovery failed: {e}")
+        return False
+
+
 def get_page_source():
     """Gets the XML page source from the appium-mcp server."""
     try:
         payload = {"tool": "get_page_source", "args": {}}
         response = requests.post(f"{MCP_SERVER_URL}/tools/run", json=payload)
+        
+        # Parse response
+        try:
+            result = response.json()
+        except:
+            # If response is not JSON, treat as error
+            error_msg = f"Invalid response from server: {response.text[:200]}"
+            print(f"❌ Error: Failed to get page source: {error_msg}")
+            return {"success": False, "error": error_msg}
+        
+        # Check for error responses (even with 200 status)
+        if result.get('success') is False:
+            error_msg = result.get('error', 'Unknown error')
+            # Check if this is a session crash
+            if _is_session_crashed_error(error_msg):
+                print(f"❌ Error: Session crashed - {error_msg}")
+                # Try to recover session
+                if _try_recover_session():
+                    # Retry once after recovery
+                    time.sleep(1)
+                    retry_response = requests.post(f"{MCP_SERVER_URL}/tools/run", json=payload, timeout=10)
+                    retry_result = retry_response.json() if retry_response.headers.get('content-type', '').startswith('application/json') else {}
+                    if retry_result.get('success'):
+                        return retry_result.get('value') or retry_result.get('xml', '')
+                    else:
+                        return {"success": False, "error": retry_result.get('error', 'Session recovery failed')}
+                else:
+                    return {"success": False, "error": "Session crashed and recovery failed. Please restart Appium server."}
+            print(f"❌ Error: Failed to get page source: {error_msg}")
+            return {"success": False, "error": error_msg}
+        
+        # Handle HTTP error status codes
         if response.status_code == 400:
-            error_msg = response.json().get('error', 'Unknown error')
-            print(f"❌ Error: {error_msg}")
-            return f"Error: {error_msg}"
+            error_msg = result.get('error', 'Unknown error')
+            if _is_session_crashed_error(error_msg):
+                if _try_recover_session():
+                    time.sleep(1)
+                    retry_response = requests.post(f"{MCP_SERVER_URL}/tools/run", json=payload, timeout=10)
+                    retry_result = retry_response.json() if retry_response.headers.get('content-type', '').startswith('application/json') else {}
+                    if retry_result.get('success'):
+                        return retry_result.get('value') or retry_result.get('xml', '')
+            print(f"❌ Error: Failed to get page source: {error_msg}")
+            return {"success": False, "error": error_msg}
+        if response.status_code == 500:
+            error_msg = result.get('error', f'500 Server Error: {response.text[:200]}')
+            if _is_session_crashed_error(error_msg):
+                if _try_recover_session():
+                    time.sleep(1)
+                    retry_response = requests.post(f"{MCP_SERVER_URL}/tools/run", json=payload, timeout=10)
+                    retry_result = retry_response.json() if retry_response.headers.get('content-type', '').startswith('application/json') else {}
+                    if retry_result.get('success'):
+                        return retry_result.get('value') or retry_result.get('xml', '')
+            print(f"❌ Error: Failed to get page source: {error_msg}")
+            return {"success": False, "error": error_msg}
+        
         response.raise_for_status() 
-        result = response.json()
+        # Success case - return XML string
         return result.get('value') or result.get('xml', '')
     except requests.RequestException as e:
-        print(f"Error getting page source: {e}")
-        return f"Error: {e}"
+        error_msg = str(e)
+        print(f"❌ Error: Failed to get page source: {error_msg}")
+        return {"success": False, "error": error_msg}
 
 
 def _normalize_for_match(value: str) -> str:
@@ -587,7 +696,6 @@ def assert_activity(expectedActivity: str, timeoutSeconds: int = 10):
     """Poll current activity until it matches expectedActivity or timeout.
     Returns { success: true/false, activity: currentActivity }.
     """
-    import time
     deadline = time.time() + max(1, int(timeoutSeconds))
     last = None
     while time.time() < deadline:

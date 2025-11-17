@@ -482,8 +482,30 @@ async function runNamedTool(helper: AppiumHelper, tool: string, args: any): Prom
     // State observation
     case 'get-page-source':
     case 'get_page_source': {
-      const xml = await h.getPageSource();
-      return { success: true, value: xml, xml };
+      try {
+        // Try to get page source - any errors will be caught below
+        const xml = await h.getPageSource();
+        return { success: true, value: xml, xml };
+      } catch (error: any) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        // Check for common session/driver errors - return as error response, not throw
+        if (errorMsg.includes('not initialized') || 
+            errorMsg.includes('session') || 
+            errorMsg.includes('connection') ||
+            errorMsg.includes('expired') ||
+            errorMsg.includes('driver')) {
+          return {
+            success: false,
+            error: `Appium session error: ${errorMsg}. The session may have expired. Please reinitialize.`
+          };
+        }
+        // For other errors, still return error response instead of throwing
+        // This prevents 500 errors and provides better error messages
+        return {
+          success: false,
+          error: `Failed to get page source: ${errorMsg}`
+        };
+      }
     }
     case 'take-screenshot':
     case 'take_screenshot': {
@@ -1092,13 +1114,37 @@ app.post('/tools/run', async (req, res) => {
       });
     }
     
+    // Validate session before executing tool (especially for get_page_source)
+    if (tool === 'get_page_source') {
+      try {
+        const driver = helper.getDriver();
+        if (!driver) {
+          return res.status(400).json({
+            success: false,
+            error: 'Appium driver not initialized. The session may have expired. Please reinitialize the session using /tools/initialize-appium'
+          });
+        }
+      } catch (driverCheckError: any) {
+        // Driver check failed - session likely expired or driver not initialized
+        const errorMsg = driverCheckError instanceof Error ? driverCheckError.message : String(driverCheckError);
+        return res.status(400).json({
+          success: false,
+          error: `Appium session error: ${errorMsg}. The session may have expired. Please reinitialize the session using /tools/initialize-appium`
+        });
+      }
+    }
+    
     const result = await runNamedTool(helper, tool, args || {});
     res.json(result);
   } catch (error) {
     console.error('Tools/run endpoint error:', error);
     const msg = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
     const isSelectorIssue = msg.includes('invalid selector') || msg.includes('invalid xpath') || msg.includes('selector') && msg.includes('invalid');
-    res.status(isSelectorIssue ? 400 : 500).json({
+    const isSessionIssue = msg.includes('session') || msg.includes('not initialized') || msg.includes('connection') || msg.includes('expired');
+    
+    // Return 400 for session/driver issues instead of 500
+    const statusCode = isSelectorIssue ? 400 : (isSessionIssue ? 400 : 500);
+    res.status(statusCode).json({
       success: false,
       error: error instanceof Error ? error.message : 'Unknown error'
     });

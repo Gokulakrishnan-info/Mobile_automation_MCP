@@ -4,7 +4,10 @@ import asyncio
 import json
 import os
 import platform
+import re
 import shutil
+import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -32,6 +35,94 @@ class AutomationRunner:
     def __init__(self, reports_dir: Path = REPORTS_DIR) -> None:
         self.reports_dir = reports_dir
         self.reports_dir.mkdir(parents=True, exist_ok=True)
+        self._current_process: Optional[Any] = None  # Store reference to current subprocess
+        self._should_stop = False  # Flag to signal stop request
+
+    def stop(self) -> None:
+        """Stop the currently running automation subprocess."""
+        self._should_stop = True
+        if self._current_process is not None:
+            try:
+                import platform
+                is_windows = platform.system() == "Windows"
+                
+                # Check if process is still running
+                is_running = False
+                if hasattr(self._current_process, 'poll'):
+                    # subprocess.Popen (Windows)
+                    is_running = self._current_process.poll() is None
+                elif hasattr(self._current_process, 'returncode'):
+                    # asyncio subprocess (Unix)
+                    is_running = self._current_process.returncode is None
+                else:
+                    is_running = True  # Assume running if we can't check
+                
+                if not is_running:
+                    return  # Process already finished
+                
+                # On Windows, use kill() directly for more reliable termination
+                # On Unix, try terminate() first, then kill() if needed
+                if is_windows:
+                    # Windows: Use kill() directly (more reliable than terminate)
+                    try:
+                        if hasattr(self._current_process, 'kill'):
+                            self._current_process.kill()
+                        elif hasattr(self._current_process, 'terminate'):
+                            self._current_process.terminate()
+                            # Wait briefly, then force kill
+                            import time
+                            time.sleep(0.5)
+                            if self._current_process.poll() is None:
+                                self._current_process.kill()
+                    except Exception as e:
+                        print(f"[WARN] Error killing process on Windows: {e}")
+                        # Try alternative method
+                        try:
+                            import os
+                            if hasattr(self._current_process, 'pid'):
+                                os.kill(self._current_process.pid, 9)  # SIGKILL equivalent
+                        except Exception:
+                            pass
+                else:
+                    # Unix: Try terminate first, then kill
+                    try:
+                        if hasattr(self._current_process, 'terminate'):
+                            self._current_process.terminate()
+                        elif hasattr(self._current_process, 'kill'):
+                            self._current_process.kill()
+                        
+                        # Wait briefly for graceful shutdown
+                        import time
+                        time.sleep(1)
+                        
+                        # Force kill if still running
+                        if hasattr(self._current_process, 'poll'):
+                            if self._current_process.poll() is None:
+                                self._current_process.kill()
+                        elif hasattr(self._current_process, 'returncode'):
+                            if self._current_process.returncode is None:
+                                self._current_process.kill()
+                    except Exception as e:
+                        print(f"[WARN] Error terminating process on Unix: {e}")
+                        # Force kill as last resort
+                        try:
+                            if hasattr(self._current_process, 'kill'):
+                                self._current_process.kill()
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"[WARN] Error in stop(): {e}")
+                # Last resort: try to kill by PID if available
+                try:
+                    if hasattr(self._current_process, 'pid'):
+                        import os
+                        import platform
+                        if platform.system() == "Windows":
+                            os.kill(self._current_process.pid, 9)
+                        else:
+                            os.kill(self._current_process.pid, signal.SIGKILL)
+                except Exception:
+                    pass
 
     async def run(
         self,
@@ -53,8 +144,7 @@ class AutomationRunner:
                 "type": "log",
                 "id": uuid.uuid4().hex,
                 "level": "info",
-                "message": "Spawning automation runner",
-                "details": json.dumps({"prompt": prompt}, indent=2),
+                "message": "Automation initiated",
             }
         )
 
@@ -89,6 +179,7 @@ class AutomationRunner:
             loop = asyncio.get_event_loop()
             executor = ThreadPoolExecutor(max_workers=3)
             process = await loop.run_in_executor(executor, run_subprocess)
+            self._current_process = process  # Store process reference for cancellation
             
             stderr_lines = []
             message_queue = asyncio.Queue()
@@ -120,6 +211,9 @@ class AutomationRunner:
             # Process messages from queue
             async def process_messages():
                 while True:
+                    # Check if stop was requested
+                    if self._should_stop:
+                        break
                     try:
                         level, message = await asyncio.wait_for(message_queue.get(), timeout=0.1)
                         # Collect stderr messages for error reporting
@@ -170,6 +264,14 @@ class AutomationRunner:
                         
                         # Filter out verbose internal logs - only show essential user-facing messages
                         # Hide all connection, MCP, Appium, and technical setup messages
+                        # Hide debug information about LLM input size
+                        if ("[DEBUG] LLM Input Size" in message or
+                            "System Prompt:" in message or
+                            "Messages (" in message and "messages):" in message or
+                            "Tools (" in message and "tools):" in message or
+                            "TOTAL:" in message and "chars" in message and "tokens" in message or
+                            "XML Limit:" in message):
+                            continue
                         should_skip = (
                             "[THINK]" in message or
                             "[CHECK]" in message or
@@ -513,13 +615,47 @@ class AutomationRunner:
             
             message_task = asyncio.create_task(process_messages())
             
-            # Wait for process to complete
+            # Wait for process to complete, checking for stop request
             def wait_process():
-                return process.wait()
+                while process.poll() is None:
+                    if self._should_stop:
+                        # Stop was requested - kill the process immediately
+                        try:
+                            # On Windows, kill() is more reliable than terminate()
+                            if platform.system() == "Windows":
+                                process.kill()
+                            else:
+                                # On Unix, try terminate first, then kill
+                                process.terminate()
+                                # Wait briefly for graceful shutdown
+                                try:
+                                    process.wait(timeout=1)
+                                except subprocess.TimeoutExpired:
+                                    # Force kill if it doesn't terminate quickly
+                                    process.kill()
+                        except Exception as e:
+                            # If terminate/kill fails, try alternative methods
+                            try:
+                                if process.poll() is None:
+                                    process.kill()
+                            except Exception:
+                                # Last resort: kill by PID
+                                try:
+                                    if hasattr(process, 'pid'):
+                                        os.kill(process.pid, signal.SIGKILL if platform.system() != "Windows" else 9)
+                                except Exception:
+                                    pass
+                        break
+                    time.sleep(0.05)  # Check every 50ms (faster response)
+                return process.poll()
             
             return_code = await loop.run_in_executor(executor, wait_process)
             await message_task
             executor.shutdown(wait=False)
+            
+            # Clear process reference after completion
+            self._current_process = None
+            self._should_stop = False
             
         else:
             # Use native asyncio subprocess for Unix-like systems
@@ -535,11 +671,18 @@ class AutomationRunner:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
             )
+            self._current_process = process  # Store process reference for cancellation
 
             stderr_lines = []
             
             async def _stream(reader: asyncio.StreamReader, level: str) -> None:
+                # Check for stop request periodically
+                if self._should_stop:
+                    return
                 while True:
+                    # Check for stop request
+                    if self._should_stop:
+                        break
                     line = await reader.readline()
                     if not line:
                         break
@@ -625,6 +768,52 @@ class AutomationRunner:
                         "Action failed after" in message or
                         "Spawning automation runner" in message or
                         "What is your goal?" in message or
+                        # Validation detection messages - hide from users
+                        ("Detected" in message and "validation requirement" in message.lower()) or
+                        "Validate:" in message or
+                        "- Validate:" in message or
+                        "   - Validate:" in message or
+                        # Technical tool management messages - hide from users
+                        "Removing orphaned tool_use" in message or
+                        "Removing orphaned tool_result" in message or
+                        "tool_use_id:" in message or
+                        "no tool_result found" in message.lower() or
+                        "no previous assistant message" in message.lower() or
+                        # LLM decision technical details - hide from users
+                        "LLM Decision: Call" in message and "args:" in message or
+                        "LLM Decision:" in message or
+                        # End turn messages - hide from users
+                        "LLM returned end_turn" in message or
+                        "end_turn but not all planned steps" in message.lower() or
+                        # Page detection technical messages - hide from users
+                        "[NAV]" in message or
+                        "Page Detected:" in message or
+                        "AUTOMATIC PAGE DETECTION" in message or
+                        "Page Identified:" in message or
+                        # Bedrock API error technical details - hide from users
+                        "Non-retryable Bedrock error" in message or
+                        "Bedrock API Error" in message and "ValidationException" in message or
+                        "ValidationException" in message or
+                        "Input is too long" in message or
+                        # Interrupt and error messages - hide from users
+                        "Interrupted by user" in message or
+                        "KeyboardInterrupt" in message or
+                        # Python traceback and stack traces - hide from users
+                        "Traceback (most recent call last)" in message or
+                        ("File \"" in message or "File " in message) and ("line" in message.lower() or "site-packages" in message or ".py" in message) or
+                        "  File " in message or
+                        (message.startswith("    ") and len(message) > 4 and any(x in message for x in ["File ", "return ", "raise ", "self.", "http", "response", "request", "invoke", "api_call"])) or
+                        "site-packages" in message or
+                        "botocore" in message.lower() or
+                        "urllib3" in message.lower() or
+                        "socket.py" in message or
+                        "ssl.py" in message or
+                        ".py\", line" in message or
+                        "in " in message and ("File " in message or ".py" in message) or
+                        # Exit codes and error reporting - hide from users
+                        "Automation runner exited with code" in message or
+                        "Automation runner reported an error" in message or
+                        "exited with code" in message.lower() or
                         # Connection and setup messages - hide from users
                         "Connecting to" in message or
                         "MCP Server" in message or
@@ -660,59 +849,158 @@ class AutomationRunner:
                     
                     # Simplify message text - make it user-friendly
                     simplified_message = message
+                    
+                    # Remove technical prefixes
                     simplified_message = simplified_message.replace("--- ", "")
                     simplified_message = simplified_message.replace("[OK] ", "")
                     simplified_message = simplified_message.replace("[ERROR] ", "")
                     simplified_message = simplified_message.replace("[WARN] ", "")
                     simplified_message = simplified_message.replace("[BOT] ", "")
+                    simplified_message = simplified_message.replace("[THINK] ", "")
+                    simplified_message = simplified_message.replace("[INFO] ", "")
                     
-                    if "Step" in simplified_message and ":" in simplified_message:
+                    # Transform "LLM is thinking" messages
+                    if "THINK:" in simplified_message or "Asking LLM" in simplified_message or "LLM Decision" in simplified_message:
+                        simplified_message = "LLM is thinking..."
+                        log_level = "info"
+                    
+                    # Transform step messages
+                    elif "Step" in simplified_message and ":" in simplified_message:
                         parts = simplified_message.split(":", 1)
                         if len(parts) > 1:
-                            simplified_message = parts[1].strip()
-                    
-                    if "Result: Pass" in simplified_message:
-                        simplified_message = "✓ Pass"
-                    elif "Result: Fail" in simplified_message:
-                        if "Error:" in simplified_message:
-                            error_part = simplified_message.split("Error:")[-1].strip()
-                            # Truncate long error messages
-                            if len(error_part) > 100:
-                                error_part = error_part[:100] + "..."
-                            simplified_message = f"✗ Fail: {error_part}"
-                        else:
-                            simplified_message = "✗ Fail"
-                    
-                    if "Action: click" in simplified_message:
-                        if "value':" in simplified_message or "'value':" in simplified_message:
-                            try:
-                                import re
-                                match = re.search(r"['\"]value['\"]:\s*['\"]([^'\"]+)['\"]", simplified_message)
+                            step_desc = parts[1].strip()
+                            # Extract action name from step description
+                            if "Click" in step_desc or "click" in step_desc:
+                                # Try to extract element name
+                                # Look for common patterns like "Click on Login" or "Click Login button"
+                                match = re.search(r'(?:Click|click)\s+(?:on\s+)?([A-Z][a-zA-Z\s]+?)(?:\s+button|\s+element|$)', step_desc)
                                 if match:
-                                    item = match.group(1)
-                                    simplified_message = f"Clicking on {item}"
+                                    element_name = match.group(1).strip()
+                                    simplified_message = f"Click on {element_name}"
                                 else:
                                     simplified_message = "Clicking element"
-                            except:
-                                simplified_message = "Clicking element"
-                        else:
-                            simplified_message = "Clicking element"
-                    elif "Action: send_keys" in simplified_message or "Action: ensure_focus_and_type" in simplified_message:
-                        if "text':" in simplified_message or "'text':" in simplified_message:
-                            try:
-                                import re
-                                match = re.search(r"['\"]text['\"]:\s*['\"]([^'\"]+)['\"]", simplified_message)
+                            elif "Type" in step_desc or "Enter" in step_desc or "type" in step_desc or "enter" in step_desc:
+                                # Try to extract text being typed
+                                match = re.search(r'(?:Type|Enter|type|enter).*?["\']([^"\']+)["\']', step_desc)
                                 if match:
-                                    text = match.group(1)
-                                    simplified_message = f"Typing: {text}"
+                                    text_value = match.group(1)
+                                    simplified_message = f"Typing: {text_value}"
                                 else:
                                     simplified_message = "Typing text"
-                            except:
-                                simplified_message = "Typing text"
+                            elif "Wait" in step_desc or "wait" in step_desc:
+                                simplified_message = "Waiting..."
+                            elif "Swipe" in step_desc or "swipe" in step_desc:
+                                simplified_message = "Swiping"
+                            elif "Scroll" in step_desc or "scroll" in step_desc:
+                                simplified_message = "Scrolling"
+                            else:
+                                simplified_message = step_desc
+                        log_level = "action"
+                    
+                    # Transform success messages
+                    elif "[SUCCESS]" in simplified_message:
+                        # Extract success message after [SUCCESS]
+                        success_text = simplified_message.split("[SUCCESS]")[-1].strip()
+                        simplified_message = f"✓ {success_text}"
+                        log_level = "success"
+                    # Transform action results
+                    elif "Result: Pass" in simplified_message or "completed successfully" in simplified_message.lower():
+                        simplified_message = "✓ Action completed successfully"
+                        log_level = "success"
+                    elif "Result: Fail" in simplified_message or "failed" in simplified_message.lower():
+                        if "Error:" in simplified_message:
+                            error_part = simplified_message.split("Error:")[-1].strip()
+                            # Simplify technical error messages
+                            if "page source" in error_part.lower() or "session" in error_part.lower() or "driver" in error_part.lower():
+                                simplified_message = "⚠ Action encountered an issue, continuing..."
+                            elif "not found" in error_part.lower() or "element" in error_part.lower():
+                                simplified_message = "⚠ Element not found, trying alternative approach..."
+                            else:
+                                # Truncate long error messages
+                                if len(error_part) > 80:
+                                    error_part = error_part[:80] + "..."
+                                simplified_message = f"⚠ Issue: {error_part}"
+                        else:
+                            simplified_message = "⚠ Action had an issue, continuing..."
+                        log_level = "error"
+                    
+                    # Transform action messages
+                    elif "Action: click" in simplified_message or "Call click" in simplified_message:
+                        # Try to extract element name/value
+                        match = re.search(r"['\"]value['\"]:\s*['\"]([^'\"]+)['\"]", simplified_message)
+                        if match:
+                            item = match.group(1)
+                            simplified_message = f"Click on {item}"
+                        else:
+                            simplified_message = "Clicking element"
+                        log_level = "action"
+                    elif "Action: send_keys" in simplified_message or "Action: ensure_focus_and_type" in simplified_message or "Call send_keys" in simplified_message or "Call ensure_focus_and_type" in simplified_message:
+                        # Try to extract text being typed
+                        match = re.search(r"['\"]text['\"]:\s*['\"]([^'\"]+)['\"]", simplified_message)
+                        if match:
+                            text = match.group(1)
+                            simplified_message = f"Typing: {text}"
                         else:
                             simplified_message = "Typing text"
-                    elif "Action:" in simplified_message:
-                        simplified_message = simplified_message.replace("Action: ", "").strip()
+                        log_level = "action"
+                    elif "Action:" in simplified_message or "Call " in simplified_message:
+                        # Extract action name
+                        action_match = re.search(r"(?:Action:\s*|Call\s+)(\w+)", simplified_message)
+                        if action_match:
+                            action_name = action_match.group(1)
+                            if action_name == "wait_for_text_ocr":
+                                simplified_message = "Waiting for text to appear..."
+                            elif action_name == "swipe":
+                                simplified_message = "Swiping"
+                            elif action_name == "scroll":
+                                simplified_message = "Scrolling"
+                            elif action_name == "long_press":
+                                simplified_message = "Long pressing"
+                            else:
+                                simplified_message = f"Performing {action_name}..."
+                        else:
+                            simplified_message = simplified_message.replace("Action: ", "").replace("Call ", "").strip()
+                        if not simplified_message:
+                            continue
+                        log_level = "action"
+                    
+                    # Transform report/statistics messages
+                    elif "[REPORT]" in simplified_message or "[STATS]" in simplified_message:
+                        if "Report:" in simplified_message:
+                            simplified_message = "✓ Automation completed - Report generated"
+                        elif "STATS" in simplified_message:
+                            # Extract stats
+                            stats_match = re.search(r'(\d+)\s+steps.*?✅\s+(\d+).*?❌\s+(\d+)', simplified_message)
+                            if stats_match:
+                                total, success, failed = stats_match.groups()
+                                simplified_message = f"✓ Completed: {success} successful, {failed} failed out of {total} steps"
+                            else:
+                                simplified_message = "✓ Automation completed"
+                        log_level = "success"
+                    
+                    # Transform error messages to be less technical
+                    elif "Error:" in simplified_message or "ERROR" in simplified_message:
+                        error_text = simplified_message.split("Error:")[-1].strip() if "Error:" in simplified_message else simplified_message
+                        # Simplify common technical errors
+                        if "page source" in error_text.lower():
+                            simplified_message = "⚠ Checking screen status..."
+                        elif "session" in error_text.lower() or "driver" in error_text.lower() or "expired" in error_text.lower():
+                            simplified_message = "⚠ Connection issue detected, retrying..."
+                        elif "not found" in error_text.lower() or "element" in error_text.lower():
+                            simplified_message = "⚠ Element not found, trying different approach..."
+                        elif "timeout" in error_text.lower():
+                            simplified_message = "⚠ Taking longer than expected, continuing..."
+                        else:
+                            # Keep error but simplify
+                            if len(error_text) > 100:
+                                error_text = error_text[:100] + "..."
+                            simplified_message = f"⚠ {error_text}"
+                        log_level = "error"
+                    
+                    # Default: clean up any remaining technical prefixes
+                    else:
+                        # Remove any remaining technical markers
+                        simplified_message = re.sub(r'\[.*?\]', '', simplified_message).strip()
                         if not simplified_message:
                             continue
                     
@@ -728,26 +1016,92 @@ class AutomationRunner:
             stdout_task = asyncio.create_task(_stream(process.stdout, "stdout"))
             stderr_task = asyncio.create_task(_stream(process.stderr, "stderr"))
 
-            return_code = await process.wait()
+            # Check for stop request periodically while waiting
+            while process.returncode is None:
+                if self._should_stop:
+                    # Stop was requested - kill the process immediately
+                    try:
+                        # On Windows, kill() is more reliable than terminate()
+                        if platform.system() == "Windows":
+                            process.kill()
+                        else:
+                            # On Unix, try terminate first, then kill
+                            process.terminate()
+                            # Wait briefly for graceful shutdown
+                            try:
+                                await asyncio.wait_for(process.wait(), timeout=1.0)
+                            except asyncio.TimeoutError:
+                                # Force kill if it doesn't terminate quickly
+                                process.kill()
+                    except Exception as e:
+                        # If terminate/kill fails, try alternative methods
+                        try:
+                            if process.returncode is None:
+                                process.kill()
+                        except Exception:
+                            # Last resort: kill by PID
+                            try:
+                                if hasattr(process, 'pid'):
+                                    if platform.system() == "Windows":
+                                        os.kill(process.pid, 9)
+                                    else:
+                                        os.kill(process.pid, signal.SIGKILL)
+                            except Exception:
+                                pass
+                    break
+                await asyncio.sleep(0.05)  # Check every 50ms (faster response)
+            
+            return_code = process.returncode if process.returncode is not None else await process.wait()
             await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            
+            # Clear process reference after completion
+            self._current_process = None
+            self._should_stop = False
 
         if return_code != 0:
+            # Don't emit technical error messages to frontend - they're already filtered
+            # Only show user-friendly message if automation was interrupted (Ctrl+C)
+            if return_code in (3221225786, -1073741510, 130, 2):  # Windows Ctrl+C, Unix Ctrl+C, KeyboardInterrupt
+                emit(
+                    {
+                        "type": "log",
+                        "id": uuid.uuid4().hex,
+                        "level": "info",
+                        "message": "Automation stopped by user",
+                    }
+                )
+            # For other errors, don't emit technical details - they're already in logs if needed
             error_summary = "\n".join(stderr_lines[-10:]) if stderr_lines else "No error details captured"
-            emit(
-                {
-                    "type": "log",
-                    "id": uuid.uuid4().hex,
-                    "level": "error",
-                    "message": f"Automation runner exited with code {return_code}",
-                    "details": f"Last stderr lines:\n{error_summary}",
-                }
-            )
             raise AutomationRunnerError(
                 f"Automation runner failed with code {return_code}. "
                 f"Error details: {error_summary[:500]}"
             )
 
-        report_path = self._find_newest_report(existing_reports, started_at)
+        # Wait a bit for the report file to be written to disk
+        # Sometimes there's a small delay between when main.py prints [REPORT] and when the file is actually written
+        report_path = None
+        for attempt in range(5):  # Try up to 5 times with delays
+            report_path = self._find_newest_report(existing_reports, started_at)
+            if report_path:
+                break
+            if attempt < 4:  # Don't wait on last attempt
+                await asyncio.sleep(0.5)  # Wait 500ms between attempts
+        
+        # If still not found, try looking in the current working directory's reports folder
+        # (main.py might save to a relative "reports" directory)
+        if not report_path:
+            # Check if main.py is running from BASE_DIR and saving to relative "reports"
+            possible_reports_dir = BASE_DIR / "reports"
+            if possible_reports_dir.exists() and possible_reports_dir != self.reports_dir:
+                # Look in the BASE_DIR/reports directory
+                candidates = [
+                    path
+                    for path in possible_reports_dir.glob("*.json")
+                    if path not in existing_reports and path.stat().st_mtime >= started_at
+                ]
+                if candidates:
+                    report_path = max(candidates, key=lambda p: p.stat().st_mtime)
+        
         if report_path:
             # Generate PDF report
             pdf_path = None
@@ -759,25 +1113,34 @@ class AutomationRunner:
                 # reportlab not installed, skip PDF generation
                 pass
             except Exception as e:
-                print(f"Warning: Failed to generate PDF report: {e}")
+                print(f"Warning: Failed to generate PDF report: {e}", file=sys.stderr)
             
-            emit(
-                {
-                    "type": "report",
-                    "report": {
-                        "id": report_path.stem,
-                        "name": report_path.name,
-                        "path": str(report_path),
-                        "pdfPath": str(pdf_path) if pdf_path else None,
-                        "status": "success",
-                        "createdAt": time.strftime(
-                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(report_path.stat().st_mtime)
-                        ),
-                        "prompt": prompt,
-                    },
-                }
-            )
-            self._emit_screenshots_from_report(report_path, emit)
+            # Emit report event to frontend
+            try:
+                emit(
+                    {
+                        "type": "report",
+                        "report": {
+                            "id": report_path.stem,
+                            "name": report_path.name,
+                            "path": str(report_path),
+                            "pdfPath": str(pdf_path) if pdf_path else None,
+                            "status": "success",
+                            "createdAt": time.strftime(
+                                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(report_path.stat().st_mtime)
+                            ),
+                            "prompt": prompt,
+                        },
+                    }
+                )
+                self._emit_screenshots_from_report(report_path, emit)
+            except Exception as e:
+                print(f"Warning: Failed to emit report event: {e}", file=sys.stderr)
+        else:
+            # Report not found - log for debugging but don't show to user
+            print(f"[DEBUG] Report not found. Searched in: {self.reports_dir}", file=sys.stderr)
+            if BASE_DIR / "reports" != self.reports_dir:
+                print(f"[DEBUG] Also checked: {BASE_DIR / 'reports'}", file=sys.stderr)
 
     def _iter_report_files(self) -> Iterable[Path]:
         return self.reports_dir.glob("*.json")

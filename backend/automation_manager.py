@@ -105,12 +105,14 @@ class AutomationManager:
             del self._screenshot_pollers[run_id]
         
         # Cancel the automation runner task
-        # The runner will check run.status and exit gracefully
         run.status = "cancelled"
         self._emit_event(run_id, {"type": "status", "status": "cancelled"})
         
+        # Stop the automation runner subprocess
+        self._runner.stop()
+        
         # Cancel the automation task if it exists
-        # Note: The actual subprocess cancellation is handled by the runner
+        # The runner will terminate the subprocess
 
     async def event_stream(self, run_id: str) -> AsyncIterator[Dict[str, Any]]:
         if run_id not in self._runs:

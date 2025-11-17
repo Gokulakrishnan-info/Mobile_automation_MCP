@@ -196,49 +196,80 @@ class TestReport:
         """Append planned steps as SKIPPED from the given step index (1-based).
         planned_steps: list of dicts with 'step' and 'name' and optional 'description'.
         start_from_step_index: the next step number to mark as skipped (1-based).
+        
+        This method finds which planned steps haven't been executed yet and marks them as skipped.
         """
         try:
-            if not isinstance(planned_steps, list):
-                planned_steps = []
-            appended_any = False
-            for plan in planned_steps:
-                try:
-                    plan_step = int(plan.get('step', 0))
-                except Exception:
-                    plan_step = 0
-                if plan_step >= start_from_step_index:
+            if not isinstance(planned_steps, list) or len(planned_steps) == 0:
+                # If no planned steps, add a generic skipped step
+                if not any(s.get('status') == 'SKIPPED' for s in self.report.get('steps', [])):
                     self.step_counter += 1
-                    # Extract meaningful description from planned step
-                    step_name = plan.get('name', '')
-                    step_desc = plan.get('description', '')
+                    step_info = {
+                        "step": self.step_counter,
+                        "timestamp": datetime.now().isoformat(),
+                        "action": "SKIPPED",
+                        "description": "Remaining steps skipped due to previous failure.",
+                        "arguments": {},
+                        "success": False,
+                        "status": "SKIPPED",
+                        "error": "Skipped due to previous failure",
+                        "is_assertion": False
+                    }
+                    self.report["steps"].append(step_info)
+                    self.report["skipped_steps"] += 1
+                    self.report["total_steps"] = self.step_counter
+                self.save()
+                return
+            
+            # Get executed step descriptions for comparison
+            executed_descriptions = set()
+            for step_info in self.report.get('steps', []):
+                desc = step_info.get('description', '')
+                if desc and step_info.get('status') != 'SKIPPED':
+                    # Normalize description for comparison
+                    executed_descriptions.add(desc.lower().strip())
+            
+            appended_any = False
+            # Find planned steps that haven't been executed
+            for plan in planned_steps:
+                # Extract step information
+                step_name = plan.get('name', '')
+                step_desc = plan.get('description', '')
+                plan_step = plan.get('step', 0)
+                
+                # Determine the description to use
+                if step_desc:
+                    description = step_desc
+                elif step_name:
+                    description = step_name
+                else:
+                    description = f"Planned step {plan_step} (from user prompt)"
+                
+                # Normalize for comparison
+                plan_desc_normalized = description.lower().strip()
+                
+                # Check if this planned step was already executed
+                # Match by description similarity or action keywords
+                found_match = False
+                for exec_desc in executed_descriptions:
+                    # Check if key action words match
+                    plan_keywords = set(plan_desc_normalized.split())
+                    exec_keywords = set(exec_desc.split())
+                    # If significant overlap, consider it executed
+                    if len(plan_keywords & exec_keywords) >= min(2, len(plan_keywords) // 2):
+                        found_match = True
+                        break
+                
+                # If not found in executed steps, mark as skipped
+                if not found_match:
+                    self.step_counter += 1
                     
-                    # Create meaningful description for skipped step based on user's original prompt
-                    # Use the step name/description directly from the planned steps (which comes from user prompt)
-                    if step_desc:
-                        # Use description if available (most accurate to user's intent)
-                        description = step_desc
-                    elif step_name:
-                        # Use step name, but make it more readable
-                        description = step_name
-                        # Clean up common patterns
-                        if description.lower().startswith('click'):
+                    # Clean up description for better readability
+                    if description.lower().startswith('click'):
+                        if not description.lower().startswith('click on'):
                             description = description.replace('Click ', '').replace('click ', '').strip()
                             if description:
                                 description = f"Click on {description}"
-                        elif description.lower().startswith('type') or description.lower().startswith('enter'):
-                            # Keep the full description for typing actions
-                            pass
-                        elif description.lower().startswith('add'):
-                            # Keep the full description for add to cart actions
-                            pass
-                        elif description.lower().startswith('go to') or description.lower().startswith('navigate'):
-                            # Keep navigation descriptions
-                            pass
-                        elif description.lower().startswith('fill') or description.lower().startswith('proceed'):
-                            # Keep form filling descriptions
-                            pass
-                    else:
-                        description = f"Planned step {plan_step} (from user prompt)"
                     
                     step_info = {
                         "step": self.step_counter,
@@ -256,22 +287,30 @@ class TestReport:
                     self.report["total_steps"] = self.step_counter
                     appended_any = True
 
+            # If no planned steps matched, add a generic skipped step
             if not appended_any:
-                self.step_counter += 1
-                step_info = {
-                    "step": self.step_counter,
-                    "timestamp": datetime.now().isoformat(),
-                    "action": "SKIPPED",
-                    "description": "Remaining steps skipped due to previous failure.",
-                    "arguments": {},
-                    "success": False,
-                    "status": "SKIPPED",
-                    "error": "Skipped due to previous failure",
-                    "is_assertion": False
-                }
-                self.report["steps"].append(step_info)
-                self.report["skipped_steps"] += 1
-                self.report["total_steps"] = self.step_counter
+                # Check if we already have a generic skipped step
+                has_generic_skipped = any(
+                    s.get('status') == 'SKIPPED' and 
+                    'Remaining steps skipped' in s.get('description', '')
+                    for s in self.report.get('steps', [])
+                )
+                if not has_generic_skipped:
+                    self.step_counter += 1
+                    step_info = {
+                        "step": self.step_counter,
+                        "timestamp": datetime.now().isoformat(),
+                        "action": "SKIPPED",
+                        "description": "Remaining steps skipped due to previous failure.",
+                        "arguments": {},
+                        "success": False,
+                        "status": "SKIPPED",
+                        "error": "Skipped due to previous failure",
+                        "is_assertion": False
+                    }
+                    self.report["steps"].append(step_info)
+                    self.report["skipped_steps"] += 1
+                    self.report["total_steps"] = self.step_counter
             self.save()
         except Exception:
             # Do not block on reporting errors

@@ -1,0 +1,17 @@
+Open the Swag Labs mobile application on the connected Android device, enter the username is standard_user and the password is secret_sauce, tap the Login button.
+
+ Open the Swag Labs mobile application on the connected Android device, enter the username is standard_user and the password is secret_sauce, tap the Login button, and verify that the Products page is visible. then add Sauce Labs bike Light product to cart and then go to cart. proceed to checkout and fill firstname as Gokul,Lastname as krishna and zip code as 607006 and then click continue.and then click finesh. 
+
+Open youtube application in the connected Android device, search for English song and then play the first video.
+
+
+
+
+Open the Swag Labs mobile application on the connected Android device, enter the username is stndard_user and the password is seeret_sauce, tap the Login button, and verify that the Products page is visible.then add Sauce Labs Bakpack item to the cart.
+
+
+ open gmail application, compose a mail to "Krishgokul1111@gmail.com" and subject as "Test message" and the body as "Test from appium MCP"
+
+
+#########################################################################
+Open the Swag Labs mobile application on the connected Android device, enter the username is standard_user and the password is secret_sauce, tap the Login button, and verify that the Products page is visible.then add Sauce Labs Bakpack item to the cart and and proceed to cart and check it added correct product only, then proceed to checkout and then fill firstname as Gokul , Lastname as krishna and zip code as 607006 and then click continue.and then click finesh.verify the order is placed.
