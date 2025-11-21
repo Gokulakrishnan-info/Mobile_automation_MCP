@@ -26,6 +26,7 @@ interface Log {
   type: "success" | "error" | "info" | "action";
   message: string;
   details?: string;
+  tool?: string;
 }
 
 interface Report {
@@ -464,6 +465,7 @@ const Dashboard = () => {
             type: (payload.level ?? "info") as Log["type"],
             message: payload.message ?? "",
             details: payload.details ?? undefined,
+            tool: payload.tool ?? undefined,
           });
         }
 

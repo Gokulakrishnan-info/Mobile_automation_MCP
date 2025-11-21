@@ -41,88 +41,19 @@ class AutomationRunner:
     def stop(self) -> None:
         """Stop the currently running automation subprocess."""
         self._should_stop = True
-        if self._current_process is not None:
-            try:
-                import platform
-                is_windows = platform.system() == "Windows"
-                
-                # Check if process is still running
-                is_running = False
-                if hasattr(self._current_process, 'poll'):
-                    # subprocess.Popen (Windows)
-                    is_running = self._current_process.poll() is None
-                elif hasattr(self._current_process, 'returncode'):
-                    # asyncio subprocess (Unix)
-                    is_running = self._current_process.returncode is None
-                else:
-                    is_running = True  # Assume running if we can't check
-                
-                if not is_running:
-                    return  # Process already finished
-                
-                # On Windows, use kill() directly for more reliable termination
-                # On Unix, try terminate() first, then kill() if needed
-                if is_windows:
-                    # Windows: Use kill() directly (more reliable than terminate)
-                    try:
-                        if hasattr(self._current_process, 'kill'):
-                            self._current_process.kill()
-                        elif hasattr(self._current_process, 'terminate'):
-                            self._current_process.terminate()
-                            # Wait briefly, then force kill
-                            import time
-                            time.sleep(0.5)
-                            if self._current_process.poll() is None:
-                                self._current_process.kill()
-                    except Exception as e:
-                        print(f"[WARN] Error killing process on Windows: {e}")
-                        # Try alternative method
-                        try:
-                            import os
-                            if hasattr(self._current_process, 'pid'):
-                                os.kill(self._current_process.pid, 9)  # SIGKILL equivalent
-                        except Exception:
-                            pass
-                else:
-                    # Unix: Try terminate first, then kill
-                    try:
-                        if hasattr(self._current_process, 'terminate'):
-                            self._current_process.terminate()
-                        elif hasattr(self._current_process, 'kill'):
-                            self._current_process.kill()
-                        
-                        # Wait briefly for graceful shutdown
-                        import time
-                        time.sleep(1)
-                        
-                        # Force kill if still running
-                        if hasattr(self._current_process, 'poll'):
-                            if self._current_process.poll() is None:
-                                self._current_process.kill()
-                        elif hasattr(self._current_process, 'returncode'):
-                            if self._current_process.returncode is None:
-                                self._current_process.kill()
-                    except Exception as e:
-                        print(f"[WARN] Error terminating process on Unix: {e}")
-                        # Force kill as last resort
-                        try:
-                            if hasattr(self._current_process, 'kill'):
-                                self._current_process.kill()
-                        except Exception:
-                            pass
-            except Exception as e:
-                print(f"[WARN] Error in stop(): {e}")
-                # Last resort: try to kill by PID if available
-                try:
-                    if hasattr(self._current_process, 'pid'):
-                        import os
-                        import platform
-                        if platform.system() == "Windows":
-                            os.kill(self._current_process.pid, 9)
-                        else:
-                            os.kill(self._current_process.pid, signal.SIGKILL)
-                except Exception:
-                    pass
+        process = self._current_process
+        if process is None:
+            return
+        try:
+            is_windows = platform.system() == "Windows"
+            if is_windows and hasattr(process, "send_signal"):
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+            elif hasattr(process, "send_signal"):
+                process.send_signal(signal.SIGINT)
+            elif hasattr(process, "terminate"):
+                process.terminate()
+        except Exception as e:
+            print(f"[WARN] Error signaling process to stop: {e}")
 
     async def run(
         self,
@@ -172,6 +103,7 @@ class AutomationRunner:
                     env=env,
                     text=False,  # Use bytes mode
                     bufsize=0,  # Unbuffered for real-time output
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
                 )
                 return process
             
@@ -262,6 +194,66 @@ class AutomationRunner:
                                 import traceback
                                 traceback.print_exc()
                         
+                        # Handle Claude Desktop-style tool call logs
+                        if "[TOOL_CALL]" in message:
+                            # Extract tool name
+                            tool_name = message.replace("[TOOL_CALL]", "").strip()
+                            # Store for next messages
+                            if not hasattr(process_messages, '_current_tool'):
+                                process_messages._current_tool = None
+                            if not hasattr(process_messages, '_tool_request'):
+                                process_messages._tool_request = None
+                            if not hasattr(process_messages, '_tool_response'):
+                                process_messages._tool_response = None
+                            process_messages._current_tool = tool_name
+                            process_messages._tool_request = None
+                            process_messages._tool_response = None
+                            # Emit as action log with tool name
+                            emit({
+                                "type": "log",
+                                "id": uuid.uuid4().hex,
+                                "level": "action",
+                                "message": f"Calling {tool_name}",
+                                "tool": tool_name,
+                            })
+                            continue
+                        elif "[TOOL_REQUEST]" in message:
+                            # Extract request JSON
+                            request_json = message.replace("[TOOL_REQUEST]", "").strip()
+                            if not hasattr(process_messages, '_tool_request'):
+                                process_messages._tool_request = None
+                            try:
+                                process_messages._tool_request = json.loads(request_json)
+                            except:
+                                process_messages._tool_request = request_json
+                            # Emit as info log with request details
+                            emit({
+                                "type": "log",
+                                "id": uuid.uuid4().hex,
+                                "level": "info",
+                                "message": f"Request",
+                                "details": request_json,
+                            })
+                            continue
+                        elif "[TOOL_RESPONSE]" in message:
+                            # Extract response JSON
+                            response_json = message.replace("[TOOL_RESPONSE]", "").strip()
+                            if not hasattr(process_messages, '_tool_response'):
+                                process_messages._tool_response = None
+                            try:
+                                process_messages._tool_response = json.loads(response_json)
+                            except:
+                                process_messages._tool_response = response_json
+                            # Emit as info log with response details
+                            emit({
+                                "type": "log",
+                                "id": uuid.uuid4().hex,
+                                "level": "info",
+                                "message": f"Response",
+                                "details": response_json,
+                            })
+                            continue
+                        
                         # Filter out verbose internal logs - only show essential user-facing messages
                         # Hide all connection, MCP, Appium, and technical setup messages
                         # Hide debug information about LLM input size
@@ -331,7 +323,7 @@ class AutomationRunner:
                             "running and accessible" in message.lower()
                         )
                         
-                        if should_skip:
+                        if should_skip or "LLM returned end_turn" in message or "LLM stop_reason" in message:
                             continue
                         
                         # Parse log level from message prefixes
@@ -619,32 +611,30 @@ class AutomationRunner:
             def wait_process():
                 while process.poll() is None:
                     if self._should_stop:
-                        # Stop was requested - kill the process immediately
                         try:
-                            # On Windows, kill() is more reliable than terminate()
-                            if platform.system() == "Windows":
-                                process.kill()
+                            if platform.system() == "Windows" and hasattr(process, "send_signal"):
+                                process.send_signal(signal.CTRL_BREAK_EVENT)
                             else:
-                                # On Unix, try terminate first, then kill
-                                process.terminate()
-                                # Wait briefly for graceful shutdown
-                                try:
-                                    process.wait(timeout=1)
-                                except subprocess.TimeoutExpired:
-                                    # Force kill if it doesn't terminate quickly
-                                    process.kill()
-                        except Exception as e:
-                            # If terminate/kill fails, try alternative methods
+                                if hasattr(process, "send_signal"):
+                                    process.send_signal(signal.SIGINT)
+                                elif hasattr(process, "terminate"):
+                                    process.terminate()
+                            # Wait up to 5 seconds for graceful shutdown
+                            waited = 0.0
+                            while process.poll() is None and waited < 5.0:
+                                time.sleep(0.1)
+                                waited += 0.1
+                            if process.poll() is None:
+                                process.kill()
+                        except Exception:
                             try:
-                                if process.poll() is None:
-                                    process.kill()
+                                process.kill()
                             except Exception:
-                                # Last resort: kill by PID
-                                try:
-                                    if hasattr(process, 'pid'):
+                                if hasattr(process, "pid"):
+                                    try:
                                         os.kill(process.pid, signal.SIGKILL if platform.system() != "Windows" else 9)
-                                except Exception:
-                                    pass
+                                    except Exception:
+                                        pass
                         break
                     time.sleep(0.05)  # Check every 50ms (faster response)
                 return process.poll()
@@ -670,6 +660,7 @@ class AutomationRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                preexec_fn=os.setsid,
             )
             self._current_process = process  # Store process reference for cancellation
 
@@ -726,6 +717,7 @@ class AutomationRunner:
                     
                     # Filter out verbose internal logs - only show essential user-facing messages
                     # Hide all connection, MCP, Appium, and technical setup messages
+                    # EXCEPT: Allow user-friendly status messages like "Getting current package" and "Asking LLM"
                     should_skip = (
                         "[THINK]" in message or
                         "[CHECK]" in message or
@@ -733,14 +725,17 @@ class AutomationRunner:
                         "[INFO]" in message or
                         "[LIST]" in message or
                         "[SCREENSHOT]" in message or
-                        "ACT:" in message or
+                        # Allow "Getting current package and activity" - user wants to see this
+                        ("ACT:" in message and "Getting current package and activity" not in message) or
                         "RESULT:" in message or
                         "OBSERVE:" in message or
-                        "THINK:" in message or
+                        # Allow "Asking LLM what to do next" - user wants to see this
+                        ("THINK:" in message and "Asking LLM what to do next" not in message) or
                         "=" * 60 in message or
                         "Getting page source" in message or
                         "Using cached page source" in message or
-                        "Asking LLM" in message or
+                        # Allow "Asking LLM what to do next" - user wants to see this
+                        ("Asking LLM" in message and "Asking LLM what to do next" not in message) or
                         "Auto-hiding keyboard" in message or
                         "Keyboard hidden" in message or
                         "Auto-injected" in message or
@@ -782,8 +777,9 @@ class AutomationRunner:
                         # LLM decision technical details - hide from users
                         "LLM Decision: Call" in message and "args:" in message or
                         "LLM Decision:" in message or
-                        # End turn messages - hide from users
+                        # End turn / debug noise
                         "LLM returned end_turn" in message or
+                        "LLM stop_reason" in message or
                         "end_turn but not all planned steps" in message.lower() or
                         # Page detection technical messages - hide from users
                         "[NAV]" in message or
@@ -846,6 +842,11 @@ class AutomationRunner:
                         log_level = "action"
                     elif "[REPORT]" in message or "[STATS]" in message or "Test Report:" in message:
                         log_level = "success"
+                    # Set log level for user-friendly status messages
+                    elif "Getting current package and activity" in message:
+                        log_level = "info"  # Show as info status
+                    elif "Asking LLM what to do next" in message:
+                        log_level = "info"  # Show as info status
                     
                     # Simplify message text - make it user-friendly
                     simplified_message = message
@@ -859,10 +860,17 @@ class AutomationRunner:
                     simplified_message = simplified_message.replace("[THINK] ", "")
                     simplified_message = simplified_message.replace("[INFO] ", "")
                     
-                    # Transform "LLM is thinking" messages
-                    if "THINK:" in simplified_message or "Asking LLM" in simplified_message or "LLM Decision" in simplified_message:
+                    # Clean up user-friendly status messages
+                    if "Getting current package and activity" in simplified_message:
+                        simplified_message = "📱 Getting current package and activity..."
+                    if "Asking LLM what to do next" in simplified_message:
+                        simplified_message = "🤔 Asking LLM what to do next..."
+                    
+                    # Transform "LLM is thinking" messages (but keep the user-friendly "Asking LLM what to do next")
+                    if ("THINK:" in simplified_message or "LLM Decision" in simplified_message) and "Asking LLM what to do next" not in simplified_message:
                         simplified_message = "LLM is thinking..."
                         log_level = "info"
+                    # Keep "Asking LLM what to do next" as-is for user visibility
                     
                     # Transform step messages
                     elif "Step" in simplified_message and ":" in simplified_message:
@@ -1019,35 +1027,30 @@ class AutomationRunner:
             # Check for stop request periodically while waiting
             while process.returncode is None:
                 if self._should_stop:
-                    # Stop was requested - kill the process immediately
                     try:
-                        # On Windows, kill() is more reliable than terminate()
-                        if platform.system() == "Windows":
-                            process.kill()
+                        if platform.system() == "Windows" and hasattr(process, "send_signal"):
+                            process.send_signal(signal.CTRL_BREAK_EVENT)
                         else:
-                            # On Unix, try terminate first, then kill
-                            process.terminate()
-                            # Wait briefly for graceful shutdown
-                            try:
-                                await asyncio.wait_for(process.wait(), timeout=1.0)
-                            except asyncio.TimeoutError:
-                                # Force kill if it doesn't terminate quickly
-                                process.kill()
-                    except Exception as e:
-                        # If terminate/kill fails, try alternative methods
+                            if hasattr(process, "send_signal"):
+                                process.send_signal(signal.SIGINT)
+                            elif hasattr(process, "terminate"):
+                                process.terminate()
                         try:
-                            if process.returncode is None:
-                                process.kill()
+                            await asyncio.wait_for(process.wait(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            process.kill()
+                    except Exception:
+                        try:
+                            process.kill()
                         except Exception:
-                            # Last resort: kill by PID
-                            try:
-                                if hasattr(process, 'pid'):
+                            if hasattr(process, 'pid'):
+                                try:
                                     if platform.system() == "Windows":
                                         os.kill(process.pid, 9)
                                     else:
                                         os.kill(process.pid, signal.SIGKILL)
-                            except Exception:
-                                pass
+                                except Exception:
+                                    pass
                     break
                 await asyncio.sleep(0.05)  # Check every 50ms (faster response)
             

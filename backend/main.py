@@ -18,7 +18,8 @@ import re
 import sys
 import signal
 import atexit
-from typing import Dict, List
+import subprocess
+from typing import Dict, List, Optional
 from botocore.exceptions import ClientError
 
 # Fix Windows console encoding issues
@@ -50,13 +51,25 @@ def safe_print(*args, **kwargs):
 from appium_tools import (
     initialize_appium_session,
     get_page_source,
+    get_page_configuration,
     get_perception_summary,
-    available_functions
+    available_functions,
+    resolve_editable_locator
 )
+import appium_tools
+from smart_executor import SmartActionExecutor
 from prompts import get_system_prompt, get_app_package_suggestions
 from reports import TestReport
 from llm_tools import tools_list_claude
+from logging_utils import setup_log_capture
 
+
+# Enable log file capture so developers can review full transcripts later
+LOG_FILE_PATH = setup_log_capture()
+if LOG_FILE_PATH:
+    print(f"--- [LOG] Console output is being saved to: {LOG_FILE_PATH}")
+else:
+    print("--- [WARN] Failed to initialize file logging. Console output will not be saved.")
 
 # --- 1. Connect to LLM API (Bedrock) ---
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
@@ -143,6 +156,141 @@ def test_tools_endpoint():
 
 # Test the endpoint (but don't fail if it returns 400/404 - that just means no session)
 test_tools_endpoint()
+
+
+DEVICE_PLATFORM = None
+DEVICE_BASE_METADATA = None
+
+
+def _run_subprocess_command(cmd: List[str], timeout: int = 5) -> str:
+    """Run a subprocess command and return stdout (stripped)."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode == 0:
+            return (result.stdout or "").strip()
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        return ""
+    return ""
+
+
+def _get_android_property(prop_name: str) -> str:
+    return _run_subprocess_command(["adb", "shell", "getprop", prop_name])
+
+
+def _detect_android_launcher_package() -> str:
+    launcher_output = _run_subprocess_command([
+        "adb", "shell", "cmd", "package", "resolve-activity",
+        "-a", "android.intent.action.MAIN",
+        "-c", "android.intent.category.HOME"
+    ])
+    if not launcher_output:
+        return ""
+    match = re.search(r'([a-zA-Z0-9._]+/[a-zA-Z0-9._$]+)', launcher_output)
+    if match:
+        return match.group(1)
+    # Some devices output "activity: com.package/.Activity"
+    parts = launcher_output.split()
+    for part in parts:
+        if '/' in part and '.' in part:
+            return part.strip()
+    return launcher_output.strip()
+
+
+def _collect_android_metadata() -> Dict[str, str]:
+    manufacturer = _get_android_property("ro.product.manufacturer")
+    model = _get_android_property("ro.product.model")
+    os_version = _get_android_property("ro.build.version.release")
+    screen_size_raw = _run_subprocess_command(["adb", "shell", "wm", "size"])
+    density_raw = _run_subprocess_command(["adb", "shell", "wm", "density"])
+    screen_size_match = re.search(r'(\d+x\d+)', screen_size_raw or "")
+    density_match = re.search(r'(\d+)', density_raw or "")
+    launcher_package = _detect_android_launcher_package()
+    metadata = {
+        "platform": "android",
+        "manufacturer": manufacturer or None,
+        "model": model or None,
+        "os_version": os_version or None,
+        "screen_size": screen_size_match.group(1) if screen_size_match else None,
+        "density": int(density_match.group(1)) if density_match else None,
+        "launcher_package": launcher_package or None,
+    }
+    return {k: v for k, v in metadata.items() if v not in (None, "", [])}
+
+
+def _collect_ios_metadata() -> Dict[str, str]:
+    model = _run_subprocess_command(["ideviceinfo", "-k", "ProductType"]) or \
+        _run_subprocess_command(["ideviceinfo", "-k", "ProductName"])
+    os_version = _run_subprocess_command(["ideviceinfo", "-k", "ProductVersion"])
+    width = _run_subprocess_command(["ideviceinfo", "-k", "DisplayWidth"])
+    height = _run_subprocess_command(["ideviceinfo", "-k", "DisplayHeight"])
+    screen_size = None
+    if width and height and width.isdigit() and height.isdigit():
+        screen_size = f"{width}x{height}"
+    metadata = {
+        "platform": "ios",
+        "model": model or None,
+        "os_version": os_version or None,
+        "screen_size": screen_size or None,
+    }
+    return {k: v for k, v in metadata.items() if v not in (None, "", [])}
+
+
+def set_device_platform(platform_name: str):
+    global DEVICE_PLATFORM
+    if platform_name:
+        DEVICE_PLATFORM = platform_name.lower()
+    else:
+        DEVICE_PLATFORM = "android"
+
+
+def get_device_metadata(force_refresh: bool = False) -> Dict[str, str]:
+    global DEVICE_BASE_METADATA
+    platform = DEVICE_PLATFORM or "android"
+    if force_refresh or DEVICE_BASE_METADATA is None:
+        if platform == "ios":
+            DEVICE_BASE_METADATA = _collect_ios_metadata()
+        else:
+            DEVICE_BASE_METADATA = _collect_android_metadata()
+        if not DEVICE_BASE_METADATA:
+            DEVICE_BASE_METADATA = {"platform": platform}
+    return DEVICE_BASE_METADATA or {"platform": platform}
+
+
+def _get_current_app_identifier() -> Optional[str]:
+    try:
+        func = available_functions.get('get_current_package_activity')
+        if callable(func):
+            result = func()
+            if isinstance(result, dict):
+                package = result.get('package') or result.get('result') or result.get('data')
+                activity = result.get('activity')
+                if package and activity:
+                    return f"{package}/{activity}"
+                if package:
+                    return package
+                message = result.get('message')
+                if message:
+                    return message
+            elif isinstance(result, str):
+                return result.strip()
+    except Exception:
+        return None
+    return None
+
+
+def build_device_context_payload(prompt_text: str, screen_state: Optional[str]) -> str:
+    metadata = dict(get_device_metadata())
+    current_app = _get_current_app_identifier()
+    if current_app:
+        metadata['current_app'] = current_app
+    payload = {
+        "device_metadata": metadata,
+        "screen_state": screen_state or "",
+        "prompt": prompt_text
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def invoke_bedrock_with_retry(bedrock_client, request_body, model_id, max_retries=3, base_delay=1):
@@ -390,6 +538,58 @@ def truncate_xml(xml_text: str, max_length: int = 40000) -> str:
     first_part = xml_text[:int(max_length * 0.7)]
     last_part = xml_text[-int(max_length * 0.2):]
     return f"{first_part}\n\n... [XML truncated for brevity] ...\n\n{last_part}"
+
+
+def truncate_text_block(text: str, max_length: int = 40000) -> str:
+    """Generic text truncation helper used for JSON/summary payloads."""
+    if not text:
+        return ""
+    if len(text) <= max_length:
+        return text
+    head = text[:int(max_length * 0.7)]
+    tail = text[-int(max_length * 0.2):]
+    return f"{head}\n\n... [truncated for brevity] ...\n\n{tail}"
+
+
+def summarize_page_configuration(config: dict, max_items: int = 60) -> str:
+    """
+    Build a concise summary of the page configuration for LLM consumption.
+    """
+    if not isinstance(config, dict):
+        return str(config)
+    
+    metadata = config.get('metadata') or {}
+    elements = config.get('elements') or []
+    
+    header = (
+        f"package={metadata.get('package') or 'unknown'} | "
+        f"activity={metadata.get('activity') or 'unknown'} | "
+        f"platform={metadata.get('platform') or 'unknown'} | "
+        f"elements={len(elements)}/{metadata.get('elementCount') or len(elements)}"
+    )
+    
+    lines = ["[PAGE CONFIG]", header]
+    for elem in elements[:max_items]:
+        alias = elem.get('alias') or 'element'
+        role = elem.get('role') or 'unknown'
+        summary = elem.get('summary') or ''
+        primary = elem.get('primaryLocator') or {}
+        locator_text = (
+            f"{primary.get('strategy')}={primary.get('value')}"
+            if primary else "n/a"
+        )
+        lines.append(f"- {alias} [{role}] {summary} | primary={locator_text}")
+    
+    remaining = len(elements) - max_items
+    if remaining > 0:
+        lines.append(f"... ({remaining} more elements truncated)")
+    
+    role_index = config.get('roleIndex') or {}
+    if role_index:
+        role_summary = ", ".join(f"{role}:{len(items)}" for role, items in role_index.items())
+        lines.append(f"[role counts] {role_summary}")
+    
+    return "\n".join(lines)
 
 
 def validate_message_pairs(messages_list: list) -> list:
@@ -894,7 +1094,23 @@ def detect_page_name_from_text(text: str, xml_text: str = None) -> str:
     elif any(keyword in text_lower for keyword in ['sign up', 'register', 'create account']):
         return "Registration Page"
     
-    # Media/Video patterns
+    # OTT/Streaming platform patterns (HIGH PRIORITY - Check first)
+    elif any(keyword in text_lower for keyword in ['profile selection', 'choose profile', 'select profile', 'who\'s watching']):
+        return "Profile Selection Page"
+    elif any(keyword in text_lower for keyword in ['my list', 'watchlist', 'saved', 'favorites']):
+        return "My List Page"
+    elif any(keyword in text_lower for keyword in ['continue watching', 'resume watching', 'resume']):
+        return "Continue Watching Page"
+    elif any(keyword in text_lower for keyword in ['season', 'episode', 'episodes', 'select episode']):
+        return "Episode Selection Page"
+    elif any(keyword in text_lower for keyword in ['movie details', 'show details', 'content details', 'title details']):
+        return "Content Details Page"
+    elif any(keyword in text_lower for keyword in ['category', 'genre', 'browse', 'categories', 'genres']):
+        return "Category Browse Page"
+    elif any(keyword in text_lower for keyword in ['trending', 'popular', 'top', 'recommended', 'recommendations']):
+        return "Recommendations Page"
+    
+    # Media/Video patterns (fallback for non-OTT video apps)
     elif any(keyword in text_lower for keyword in ['video', 'player', 'play', 'pause', 'youtube']):
         return "Video Player Page"
     elif any(keyword in text_lower for keyword in ['search results', 'results for']):
@@ -928,7 +1144,7 @@ def auto_detect_page_after_navigation(session_id: str = None) -> dict:
     import appium_tools
     
     # Wait for page to load (reduced to 0.2s - XML parsing is fast and page usually loads quickly)
-    time.sleep(0.2)
+    time.sleep(0.05)  # Reduced wait for faster execution
     
     # Strategy 1: Extract prominent text from XML page source
     try:
@@ -1069,7 +1285,87 @@ def _is_session_crashed_error(error_msg: str) -> bool:
     return any(indicator in error_lower for indicator in crash_indicators)
 
 
-def _execute_with_retry(function_name: str, function_args: dict, available_functions: dict, expected_inputs: dict, max_retries: int = 3):
+def _extract_app_targets(user_goal: str | None) -> list[str]:
+    """Extract app names mentioned in user goal (e.g., 'open YouTube')."""
+    if not user_goal:
+        return []
+    targets = []
+    patterns = re.findall(r'\b(?:open|launch|start)\s+([a-z0-9 .&_-]+?)(?:\s+(?:and|to|for|with)\b|[,.!?]|$)', user_goal, re.IGNORECASE)
+    for match in patterns:
+        cleaned = match.strip(" .,-_")
+        if cleaned:
+            targets.append(cleaned)
+    # Single words like 'youtube' might not be in pattern if no verb; fallback by scanning for known app triggers
+    extra = re.findall(r'\b(youtube|yt music|gmail|linkedin|whatsapp|calculator|camera|gallery|play store|gpay|google pay|chrome|maps)\b', user_goal, re.IGNORECASE)
+    for word in extra:
+        cleaned = word.strip()
+        if cleaned and cleaned.lower() not in [t.lower() for t in targets]:
+            targets.append(cleaned)
+    return targets
+
+
+def _refine_click_locator(function_args: dict,
+                          cached_page_config: dict | None,
+                          user_goal: str | None,
+                          config_fetcher=None):
+    """Refine ambiguous launcher clicks using structured page configuration aliases."""
+    if (not cached_page_config or not isinstance(cached_page_config, dict)) and callable(config_fetcher):
+        try:
+            cached_page_config = config_fetcher("click locator refinement")
+        except Exception as fetch_error:
+            print(f"[WARN]  Could not fetch page configuration for refinement: {fetch_error}")
+            cached_page_config = None
+    if not cached_page_config or not isinstance(function_args, dict):
+        return function_args, None, None
+    strategy = function_args.get('strategy')
+    value = (function_args.get('value') or '').strip()
+    ambiguous_ids = {
+        "com.sec.android.app.launcher:id/icon",
+        "com.sec.android.app.launcher:id/folder_icon_view",
+        "com.sec.android.app.launcher:id/wsCellLayout"
+    }
+    if value not in ambiguous_ids:
+        return function_args, None, None
+    targets = _extract_app_targets(user_goal)
+    if not targets:
+        return function_args, None, None
+    elements = cached_page_config.get('elements') or []
+    for target in targets:
+        t_lower = target.lower()
+        for elem in elements:
+            if (elem.get('resourceId') or '').lower() != value.lower():
+                continue
+            text_blob = " ".join(filter(None, [
+                elem.get('alias'),
+                elem.get('text'),
+                elem.get('contentDescription'),
+                elem.get('summary')
+            ]))
+            if text_blob and t_lower in text_blob.lower():
+                locators = elem.get('locators') or []
+                primary = elem.get('primaryLocator')
+                candidate_locators = []
+                if primary:
+                    candidate_locators.append(primary)
+                candidate_locators.extend(locators)
+                for locator in candidate_locators:
+                    if locator and locator.get('strategy') and locator.get('value'):
+                        refined_args = dict(function_args)
+                        refined_args['strategy'] = locator['strategy']
+                        refined_args['value'] = locator['value']
+                        return refined_args, elem.get('alias'), target
+    return function_args, None, None
+
+
+def _execute_with_retry(function_name: str,
+                        function_args: dict,
+                        available_functions: dict,
+                        expected_inputs: dict,
+                        smart_executor: SmartActionExecutor | None = None,
+                        max_retries: int = 3,
+                        user_goal: str | None = None,
+                        cached_page_config: dict | None = None,
+                        config_fetcher=None):
     """
     Execute an action with retry logic and fallback strategies.
     
@@ -1078,6 +1374,7 @@ def _execute_with_retry(function_name: str, function_args: dict, available_funct
         function_args: Arguments for the function
         available_functions: Dictionary of available functions
         expected_inputs: Dictionary of expected inputs (for validation)
+        smart_executor: Optional smart executor for deterministic fallbacks
         max_retries: Maximum number of retry attempts (default: 3)
     
     Returns:
@@ -1095,6 +1392,60 @@ def _execute_with_retry(function_name: str, function_args: dict, available_funct
     if disable_launch and function_name == 'launch_app':
         return {"success": False, "error": "launch_app disabled by configuration (DISABLE_LAUNCH_APP)"}
     
+    refined_alias = None
+    refined_target = None
+    if function_name == 'click':
+        function_args, refined_alias, refined_target = _refine_click_locator(
+            function_args, cached_page_config, user_goal, config_fetcher
+        )
+        if refined_alias and refined_target:
+            print(f"--- [SMART] Refined click: target '{refined_target}' matched alias '{refined_alias}'")
+    
+    # Check if sending "\n" to search fields - only block if search button is visible
+    if function_name in ('send_keys', 'ensure_focus_and_type'):
+        text_value = function_args.get('text', '')
+        element_value = function_args.get('value', '').lower()
+        is_search_field = 'search' in element_value or 'query' in element_value
+        if is_search_field and (text_value == '\\n' or text_value == '\n' or text_value == '\\n'):
+            # Check if a search button exists in the page source before blocking
+            try:
+                # Get page source to check for search button
+                xml_result = get_page_source()
+                xml_text = ""
+                if isinstance(xml_result, dict):
+                    if xml_result.get('success'):
+                        xml_text = xml_result.get('value', '') or xml_result.get('xml', '') or ""
+                elif isinstance(xml_result, str):
+                    xml_text = xml_result
+                else:
+                    xml_text = str(xml_result or "")
+                
+                # Check if search button exists in XML
+                has_search_button = False
+                if xml_text:
+                    xml_lower = xml_text.lower()
+                    # Look for search/submit buttons in the XML
+                    search_button_patterns = [
+                        'resource-id="' in xml_lower and ('search' in xml_lower or 'submit' in xml_lower),
+                        'content-desc="' in xml_lower and ('search' in xml_lower or 'submit' in xml_lower),
+                        'class="android.widget.button' in xml_lower and 'search' in xml_lower,
+                        'class="android.widget.imagebutton' in xml_lower and 'search' in xml_lower
+                    ]
+                    has_search_button = any(search_button_patterns)
+                
+                if has_search_button:
+                    print(f"--- [BLOCKED] Search button found in page source. Preventing sending '\\n' to search field '{element_value}'. Use click on search button instead.")
+                    return {
+                        "success": False,
+                        "error": "A search button is visible in the page source. You MUST call get_page_source to find the search button (resource-id containing 'search' or 'submit', or content-desc containing 'Search' or 'Submit') and click it to submit the search. Do NOT send '\\n' when a search button is available."
+                    }
+                else:
+                    print(f"--- [ALLOWED] No search button found in page source. Allowing '\\n' as fallback for search field '{element_value}'.")
+                    # Allow "\n" to proceed - no search button found, so Enter key is acceptable fallback
+            except Exception as e:
+                print(f"--- [WARN] Could not check for search button: {e}. Allowing '\\n' as fallback.")
+                # If check fails, allow "\n" to proceed as fallback
+    
     function_to_call = available_functions[function_name]
     last_error = None
     
@@ -1109,6 +1460,32 @@ def _execute_with_retry(function_name: str, function_args: dict, available_funct
             return False
         return True
 
+    # PRE-VALIDATION: Auto-resolve container IDs to EditText before smart executor runs
+    # This fixes 90% of cases where LLM chooses container instead of EditText
+    if smart_executor and smart_executor.can_handle(function_name):
+        if function_name in ('send_keys', 'ensure_focus_and_type'):
+            strategy = function_args.get('strategy', '')
+            value = function_args.get('value', '')
+            
+            # Check if value is a container pattern
+            container_keywords = ("chip_group", "chipgroup", "container", "wrapper", "layout", "viewgroup", "recycler")
+            if value and any(keyword in value.lower() for keyword in container_keywords):
+                # Auto-resolve container to EditText BEFORE smart executor runs
+                resolved_strategy, resolved_value = resolve_editable_locator(strategy, value)
+                if resolved_strategy != strategy or resolved_value != value:
+                    print(f"--- [AUTO-FIX] Resolved container '{value}' to EditText: {resolved_strategy}={resolved_value}")
+                    # Update function_args with resolved locator (create new dict to ensure update)
+                    function_args = dict(function_args)  # Make a copy
+                    function_args['strategy'] = resolved_strategy
+                    function_args['value'] = resolved_value
+        
+        try:
+            smart_result = smart_executor.execute(function_name, function_args, enforce_expected_inputs=True)
+            if smart_result is not None:
+                return smart_result
+        except ValueError as strict_error:
+            return {"success": False, "error": str(strict_error)}
+
     for attempt in range(1, max_retries + 1):
         # First attempt: try original action
         if attempt == 1:
@@ -1118,7 +1495,7 @@ def _execute_with_retry(function_name: str, function_args: dict, available_funct
             print(f"  [RETRY] Attempt {attempt}/{max_retries}: Trying fallback strategy...")
             
             # Wait a bit before retry (reduced from 1s to 0.3s for faster retries)
-            time.sleep(0.3)
+            time.sleep(0.1)  # Reduced wait for faster execution
             
             # Fallback strategies based on action type
             if function_name in ('send_keys', 'ensure_focus_and_type'):
@@ -1133,7 +1510,7 @@ def _execute_with_retry(function_name: str, function_args: dict, available_funct
                     scroll_result = appium_tools.scroll_to_element(strategy=strategy, value=value)
                     if isinstance(scroll_result, dict) and scroll_result.get('success'):
                         # Wait a bit after scrolling (reduced from 0.5s to 0.2s)
-                        time.sleep(0.2)
+                        time.sleep(0.05)  # Reduced wait for faster execution
                         result = function_to_call(**function_args)
                     else:
                         # If scroll fails, try ensure_focus_and_type instead of send_keys
@@ -1156,7 +1533,7 @@ def _execute_with_retry(function_name: str, function_args: dict, available_funct
                     print(f"  [FALLBACK] Clicking element first, then typing...")
                     click_result = appium_tools.click(strategy=strategy, value=value)
                     if isinstance(click_result, dict) and click_result.get('success'):
-                        time.sleep(0.2)
+                        time.sleep(0.05)  # Reduced wait for faster execution
                         result = function_to_call(**function_args)
                     else:
                         result = function_to_call(**function_args)
@@ -1173,7 +1550,7 @@ def _execute_with_retry(function_name: str, function_args: dict, available_funct
                     print(f"  [FALLBACK] Scrolling to element before clicking...")
                     scroll_result = appium_tools.scroll_to_element(strategy=strategy, value=value)
                     if isinstance(scroll_result, dict) and scroll_result.get('success'):
-                        time.sleep(0.2)
+                        time.sleep(0.05)  # Reduced wait for faster execution
                         result = function_to_call(**function_args)
                     else:
                         result = function_to_call(**function_args)
@@ -1182,7 +1559,7 @@ def _execute_with_retry(function_name: str, function_args: dict, available_funct
                     print(f"  [FALLBACK] Waiting for element with longer timeout, then clicking...")
                     wait_result = appium_tools.wait_for_element(strategy=strategy, value=value, timeoutMs=10000)
                     if isinstance(wait_result, dict) and wait_result.get('success'):
-                        time.sleep(0.2)
+                        time.sleep(0.05)  # Reduced wait for faster execution
                         result = function_to_call(**function_args)
                     else:
                         result = function_to_call(**function_args)
@@ -1341,11 +1718,70 @@ def format_step_description(function_name: str, function_args: dict) -> str:
             return f"Type {text} in {value}"
     elif function_name == 'click':
         value = function_args.get('value', '')
+        value_lower = value.lower()
+
+        def humanize_identifier(identifier: str) -> str:
+            if not identifier:
+                return ""
+            cleaned = identifier.replace('tag_', '').replace('test_', '')
+            cleaned = re.sub(r'[_\-]+', ' ', cleaned)
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+            return cleaned or identifier
+
+        def ordinal_label(idx: int) -> str:
+            lookup = {
+                1: "first",
+                2: "second",
+                3: "third",
+                4: "fourth",
+                5: "fifth"
+            }
+            return lookup.get(idx, f"{idx}th")
+
+        def describe_xpath_target(expression: str) -> str | None:
+            if not expression:
+                return None
+            resource_match = re.search(r'@resource-id="([^"]+)"', expression)
+            content_desc_match = re.search(r'@content-desc="([^"]+)"', expression)
+            label = None
+            if resource_match:
+                label = humanize_identifier(resource_match.group(1))
+            elif content_desc_match:
+                label = content_desc_match.group(1)
+            if not label:
+                return None
+            index_label = ""
+            index_match = re.search(r'@resource-id="[^"]+"\]\[(\d+)\]', expression)
+            if not index_match:
+                index_match = re.search(r'\]\[(\d+)\]', expression)
+            if index_match:
+                try:
+                    idx = int(index_match.group(1))
+                    index_label = ordinal_label(idx)
+                except ValueError:
+                    index_label = ""
+            if index_label:
+                return f"Click on {index_label} {label}".strip()
+            return f"Click on {label}"
+
+        if value and value.startswith("//"):
+            xpath_description = describe_xpath_target(value)
+            if xpath_description:
+                return xpath_description
+        if '@content-desc' in value_lower:
+            content_desc_match = re.search(r'@content-desc="([^"]+)"', value)
+            if content_desc_match:
+                return f"Click on {content_desc_match.group(1)}"
+        strategy = function_args.get('strategy')
+        if strategy in ('content-desc', 'accessibility_id') and isinstance(function_args.get('value'), str):
+            desc_value = function_args.get('value')
+            if desc_value:
+                return f"Click on {desc_value}"
         # Try to extract meaningful text from value
-        if 'login' in value.lower() or 'button' in value.lower():
-            return f"Click on Login button"
-        elif 'logout' in value.lower():
-            return f"Click logout"
+        if 'login' in value_lower or 'button' in value_lower:
+            return "Click on Login button"
+        elif 'logout' in value_lower:
+            return "Click logout"
         else:
             return f"Click on {value}"
     elif function_name == 'wait_for_element':
@@ -1389,6 +1825,76 @@ def add_skipped_steps_if_needed(test_report, step_counter):
     except Exception:
         pass  # Don't block on skipped steps errors
 
+
+def finalize_and_generate_report(test_report, status: str = "completed", error: Optional[str] = None, completion_message: Optional[str] = None):
+    """Finalize the test report, generate PDF, and print completion summary.
+    
+    Args:
+        test_report: The TestReport instance
+        status: Final status ("completed", "error", "failed", etc.)
+        error: Optional error message
+        completion_message: Optional custom completion message
+        
+    Returns:
+        Tuple of (report_filename, pdf_path)
+    """
+    # Print completion header
+    if status == "completed":
+        print("\n" + "="*60)
+        print("✅ AUTOMATION COMPLETED SUCCESSFULLY")
+        print("="*60)
+    elif status in ("failed", "error"):
+        print("\n" + "="*60)
+        print("❌ AUTOMATION COMPLETED WITH ERRORS")
+        print("="*60)
+    else:
+        print("\n" + "="*60)
+        print(f"⚠️  AUTOMATION {status.upper()}")
+        print("="*60)
+    
+    # Print detailed step summary
+    summary = test_report.get_summary()
+    print(f"\n📊 EXECUTION SUMMARY:")
+    print(f"   {summary}")
+    
+    # Print step-by-step breakdown
+    steps = test_report.report.get('steps', [])
+    if steps:
+        print(f"\n📋 STEP BREAKDOWN:")
+        for step in steps:
+            step_num = step.get('step', 0)
+            status_icon = '✅' if step.get('status') == 'PASS' else '❌' if step.get('status') == 'FAIL' else '⏭️'
+            description = step.get('description', step.get('action', 'Unknown'))
+            print(f"   {status_icon} Step {step_num}: {description}")
+    
+    if completion_message:
+        print(f"\n💬 {completion_message}")
+    
+    # Finalize and save report
+    print(f"\n📄 Generating report...")
+    report_filename = test_report.finalize(status, error)
+    print(f"   ✓ JSON Report saved: {report_filename.name}")
+    
+    # Generate PDF report
+    pdf_path = None
+    try:
+        from pdf_generator import PDFReportGenerator
+        pdf_generator = PDFReportGenerator(reports_dir=str(test_report.reports_dir))
+        pdf_path = pdf_generator.generate_pdf(report_filename)
+        if pdf_path:
+            print(f"   ✓ PDF Report generated: {pdf_path.name}")
+        else:
+            print(f"   ⚠ PDF generation returned None (reportlab may not be installed)")
+    except ImportError:
+        print(f"   ⚠ PDF generation skipped (reportlab not installed)")
+    except Exception as e:
+        print(f"   ⚠ PDF generation failed: {e}")
+    
+    print(f"\n📊 Final Statistics: {summary}")
+    print("="*60 + "\n")
+    
+    return report_filename, pdf_path
+
 def main(provided_goal: str | None = None):
     """Main execution loop for mobile automation.
 
@@ -1399,7 +1905,41 @@ def main(provided_goal: str | None = None):
     
     # Track if last action requires verification (for assertion enforcement)
     main._last_requires_verification = False
-    main._last_action_type = None
+    main._keyboard_visible = False
+    main._recent_failure = False
+    
+    def hide_keyboard_if_needed(context: str):
+        """Hide keyboard if it was opened by the last text input action."""
+        if getattr(main, '_keyboard_visible', False):
+            print(f"--- [KEYBOARD] Auto-hiding keyboard before {context} (keyboard may cover UI)...")
+            try:
+                hide_result = appium_tools.hide_keyboard()
+                if isinstance(hide_result, dict) and hide_result.get('success'):
+                    print("--- [OK] Keyboard hidden successfully")
+                else:
+                    print("--- [WARN]  Keyboard hide attempt completed (keyboard may already be hidden)")
+            except Exception as kb_error:
+                print(f"--- [WARN]  Could not hide keyboard before {context}: {kb_error}")
+            finally:
+                main._keyboard_visible = False
+    
+    def get_page_source_guarded(context: str):
+        """Get page source after ensuring the keyboard is hidden."""
+        hide_keyboard_if_needed(context)
+        return get_page_source()
+    
+    def get_page_configuration_guarded(context: str, max_elements: int | None = None, include_static_text: bool = False):
+        """Get structured page configuration after ensuring the keyboard is hidden."""
+        hide_keyboard_if_needed(context)
+        kwargs = {}
+        if max_elements:
+            kwargs["maxElements"] = max_elements
+        if include_static_text:
+            kwargs["includeStaticText"] = True
+        try:
+            return get_page_configuration(**kwargs)
+        except Exception as config_error:
+            return {"success": False, "error": str(config_error)}
     # Track step number for logging
     step_number = 0
     
@@ -1610,6 +2150,9 @@ def main(provided_goal: str | None = None):
         return
     
     # Session is now initialized, continue with automation
+    platform_hint = locals().get('device_type', 'Android')
+    set_device_platform(platform_hint)
+    get_device_metadata(force_refresh=True)
     
     if provided_goal:
         user_goal = provided_goal
@@ -1632,6 +2175,11 @@ def main(provided_goal: str | None = None):
     reports_dir = Path(__file__).resolve().parent / "reports"
     test_report = TestReport(user_goal, reports_dir=str(reports_dir))
     _test_report_for_signal = test_report  # Store for signal handlers (global variable)
+    # Create the initial report file immediately so even very short runs have an artifact
+    try:
+        test_report.save()
+    except Exception as save_error:
+        print(f"[WARN]  Unable to create initial report file: {save_error}")
     
     # Define signal handler for graceful shutdown
     def signal_handler(signum, frame):
@@ -1639,9 +2187,12 @@ def main(provided_goal: str | None = None):
         print(f"\n\n--- [WARN]  Received signal {signum} - Saving report and exiting... ---")
         if _test_report_for_signal is not None:
             try:
-                report_filename = _test_report_for_signal.finalize("cancelled", "Automation stopped by user")
-                print(f"\n[REPORT] Report: {report_filename}")
-                print(f"[STATS] {_test_report_for_signal.get_summary()}")
+                finalize_and_generate_report(
+                    _test_report_for_signal,
+                    "cancelled",
+                    "Automation stopped by user",
+                    "Automation was cancelled by user."
+                )
             except Exception as save_error:
                 print(f"[WARN]  Warning: Failed to save report: {save_error}")
         sys.exit(0)
@@ -1662,70 +2213,147 @@ def main(provided_goal: str | None = None):
             try:
                 # Only save if report hasn't been finalized yet
                 if _test_report_for_signal.report.get('status') not in ('completed', 'failed', 'cancelled', 'interrupted'):
-                    report_filename = _test_report_for_signal.finalize("cancelled", "Automation stopped")
-                    print(f"\n[REPORT] Report: {report_filename}")
-                    print(f"[STATS] {_test_report_for_signal.get_summary()}")
+                    finalize_and_generate_report(
+                        _test_report_for_signal,
+                        "cancelled",
+                        "Automation stopped",
+                        "Automation was stopped."
+                    )
             except Exception:
                 pass  # Ignore errors in exit handler
     
     atexit.register(exit_handler)
     
     # Message history management constants
-    MAX_MESSAGES = 15  # Reduced from 20 to prevent "Input is too long" errors
-    MAX_XML_LENGTH = 30000  # Base XML length - will be reduced dynamically as messages accumulate
+    MAX_MESSAGES = 30  # Increased from 15 to support longer test cases with more steps
+    MAX_XML_LENGTH = 30000  # Base page-state length - reduced dynamically as messages accumulate
     MAX_ACTION_CYCLES = 50  # Maximum number of action cycles to prevent infinite loops
     action_cycle_count = 0  # Track number of action cycles
     
     # Cost optimization flags (can be set via environment variables)
+    USE_PAGE_CONFIGURATION = os.getenv('USE_PAGE_CONFIGURATION', 'false').lower() in ('1', 'true', 'yes')
     USE_XML_COMPRESSION = os.getenv('USE_XML_COMPRESSION', 'true').lower() in ('1', 'true', 'yes')
-    USE_XML_DIFF = os.getenv('USE_XML_DIFF', 'true').lower() in ('1', 'true', 'yes')
     USE_BATCH_STEPS = os.getenv('USE_BATCH_STEPS', 'false').lower() in ('1', 'true', 'yes')
     
-    # Store previous XML for diff calculation
-    _previous_xml = None
-    
-    # Dynamic XML length reduction based on message count
+    # Dynamic length reduction based on message count
     def get_dynamic_xml_length(message_count: int) -> int:
-        """Reduce XML length as message count increases to prevent input overflow."""
+        """Reduce perception payload length as message count increases to prevent input overflow."""
         if message_count <= 5:
             return MAX_XML_LENGTH  # 30K for first few messages
         elif message_count <= 10:
             return 20000  # 20K when 6-10 messages
         elif message_count <= 15:
             return 15000  # 15K when 11-15 messages
+        elif message_count <= 20:
+            return 12000  # 12K when 16-20 messages
+        elif message_count <= 25:
+            return 10000  # 10K when 21-25 messages
         else:
-            return 10000  # 10K when >15 messages
+            return 8000  # 8K when >25 messages (more aggressive truncation for very long conversations)
     
-    # Fast path: Get XML page source only (skip OCR for initial load speed)
-    try:
-        xml_result = get_page_source()
-        # Handle both string (success) and dict (error) returns
-        if isinstance(xml_result, dict):
-            if xml_result.get('success'):
-                current_screen_xml = xml_result.get('value', '')
+    def render_config_state(config_result):
+        """Convert page configuration result into (summary, payload, data) tuple."""
+        if isinstance(config_result, dict):
+            if config_result.get('success'):
+                config = config_result.get('config') or {}
+                summary_text = summarize_page_configuration(config)
+                if USE_XML_COMPRESSION:
+                    payload_text = json.dumps(config, ensure_ascii=False, separators=(',', ':'))
+                else:
+                    payload_text = json.dumps(config, ensure_ascii=False, indent=2)
+                return summary_text, payload_text, config
+            return f"[ERROR] Page configuration unavailable: {config_result.get('error', 'Unknown error')}", "", None
+        return str(config_result), "", None
+    
+    def fetch_page_config_snapshot(context: str):
+        """Fetch a page configuration snapshot on demand (fallback usage)."""
+        nonlocal _cached_page_config, _cached_page_config_timestamp
+        try:
+            config_result = get_page_configuration_guarded(context)
+            summary_text, payload_text, config_data = render_config_state(config_result)
+            if config_data:
+                snapshot_payload = payload_text or summary_text or "[WARN] Page configuration not available."
+                summary_text = summary_text or "[WARN] Page configuration not available."
+                _cached_page_config = {
+                    "summary": summary_text,
+                    "payload": snapshot_payload,
+                    "data": config_data
+                }
+                _cached_page_config_timestamp = time.time()
+                return config_data
             else:
-                current_screen_xml = f"[Error getting page source: {xml_result.get('error', 'Unknown error')}]"
-        else:
-            current_screen_xml = xml_result
-        # Apply cost optimizations: compression and diff
-        if USE_XML_COMPRESSION:
-            current_screen_xml = compress_xml(current_screen_xml)
-        
-        # Use dynamic XML length based on current message count (initial load)
-        dynamic_xml_limit = get_dynamic_xml_length(1)  # First message
-        truncated_current_xml = truncate_xml(current_screen_xml, dynamic_xml_limit)
-        
-        # Store for diff calculation
-        _previous_xml = current_screen_xml
-        
-        initial_perception_block = f"[XML Page Source (compressed)]:\n{truncated_current_xml}"
-    except Exception as e:
-        print(f"[WARN]  Failed to get page source: {e}")
-        initial_perception_block = "[Unable to get page source]"
+                print(f"[WARN]  Page configuration fallback returned no data: {summary_text}")
+        except Exception as cfg_error:
+            print(f"[WARN]  Failed to fetch page configuration snapshot ({context}): {cfg_error}")
+        return None
+    
+    initial_config_snapshot = None
+    initial_xml_snapshot = None
+    if USE_PAGE_CONFIGURATION:
+        # Fast path: Get structured page configuration for initial load
+        try:
+            config_result = get_page_configuration_guarded("initial observation")
+            summary_text, payload_text, config_data = render_config_state(config_result)
+            snapshot_payload = payload_text or summary_text
+            if not summary_text:
+                summary_text = "[WARN] Page configuration not available."
+            if not snapshot_payload:
+                snapshot_payload = summary_text
+            initial_config_snapshot = {
+                "summary": summary_text,
+                "payload": snapshot_payload,
+                "data": config_data
+            }
+            
+            dynamic_context_limit = get_dynamic_xml_length(1)  # First message
+            truncated_summary = truncate_text_block(summary_text, dynamic_context_limit)
+            truncated_payload = truncate_text_block(snapshot_payload, dynamic_context_limit)
+            
+            initial_perception_block = f"[Page Configuration Summary]:\n{truncated_summary}"
+        except Exception as e:
+            print(f"[WARN]  Failed to get page configuration: {e}")
+            initial_perception_block = "[Unable to get page configuration]"
+            truncated_payload = ""
+            initial_config_snapshot = None
+    else:
+        # Fast path: Get XML page source (skip OCR for initial load speed)
+        try:
+            xml_result = get_page_source_guarded("initial observation")
+            # Handle both string (success) and dict (error) returns
+            if isinstance(xml_result, dict):
+                if xml_result.get('success'):
+                    current_screen_xml = xml_result.get('value', '')
+                else:
+                    current_screen_xml = f"[Error getting page source: {xml_result.get('error', 'Unknown error')}]"
+            else:
+                current_screen_xml = xml_result
+            # Apply cost optimizations: compression and diff
+            if USE_XML_COMPRESSION:
+                current_screen_xml = compress_xml(current_screen_xml)
+            
+            # Use dynamic XML length based on current message count (initial load)
+            dynamic_xml_limit = get_dynamic_xml_length(1)  # First message
+            truncated_current_xml = truncate_xml(current_screen_xml, dynamic_xml_limit)
+            
+            # Store for diff calculation
+            _previous_xml = current_screen_xml
+            initial_xml_snapshot = current_screen_xml
+            
+            initial_perception_block = f"[XML Page Source (compressed)]:\n{truncated_current_xml}"
+        except Exception as e:
+            print(f"[WARN]  Failed to get page source: {e}")
+            initial_perception_block = "[Unable to get page source]"
+            truncated_current_xml = ""
+            initial_xml_snapshot = None
 
-    # Control whether to include raw XML in messages (and thereby risk console echoes)
-    suppress_xml = os.getenv('SUPPRESS_XML', '').lower() in ('1', 'true', 'yes')
-    initial_xml_block = "[Perception summary omitted]" if suppress_xml else initial_perception_block
+    # Control whether to include the structured snapshot in messages
+    suppress_page_state = os.getenv('SUPPRESS_XML', '').lower() in ('1', 'true', 'yes')
+    if USE_PAGE_CONFIGURATION:
+        initial_state_block = "[Perception summary omitted]" if suppress_page_state else initial_perception_block
+        initial_screen_state_for_payload = truncated_payload if isinstance(truncated_payload, str) else ""
+    else:
+        initial_state_block = "[Perception summary omitted]" if suppress_page_state else initial_perception_block
+        initial_screen_state_for_payload = truncated_current_xml if isinstance(truncated_current_xml, str) else ""
     
     # Extract strict inputs from the goal (e.g., username/password) to prevent auto-correction
     import re
@@ -1747,21 +2375,62 @@ def main(provided_goal: str | None = None):
     # Disable direct launch by default unless explicitly re-enabled via env
     disable_launch = os.getenv('DISABLE_LAUNCH_APP', '1').lower() in ('1', 'true', 'yes')
     # Always guide the LLM NOT to directly launch apps when disabled
-    initial_guidance = (
+    base_guidance = (
         "IMPORTANT: Do NOT call launch_app(). Navigate using the current UI only (home/back/search), and operate within visible apps."
         if disable_launch else
         "IMPORTANT: If the goal mentions an app that is not visible, you MAY launch that app using launch_app(), otherwise navigate within the current UI."
     )
+    
+    # Add flow-specific guidance based on user goal
+    user_goal_lower = user_goal.lower()
+    flow_guidance = ""
+    
+    if any(keyword in user_goal_lower for keyword in ['login', 'sign in', 'username', 'password']):
+        flow_guidance = "\n\nLOGIN FLOW STEPS:\n1. Call get_page_source to inspect the current login screen XML\n2. Locate the username EditText node (verify class + resource-id)\n3. Use ensure_focus_and_type or send_keys to enter username\n4. Locate the password EditText node\n5. Use ensure_focus_and_type or send_keys to enter password\n6. Locate the Login button node and click it\n7. Call wait_for_element or wait_for_text_ocr to verify login success"
+    elif any(keyword in user_goal_lower for keyword in ['compose', 'email', 'mail', 'send']):
+        flow_guidance = "\n\nEMAIL COMPOSE FLOW STEPS:\n1. Call get_page_source to understand the current screen\n2. Locate the Compose button node and click it\n3. Refresh get_page_source to capture the compose UI\n4. Locate the 'To' EditText (if the locator points to a container, drill into descendant EditText)\n5. Type recipient email using ensure_focus_and_type\n6. Locate the Subject field and type subject\n7. Locate the Body field and type the email body\n8. Locate the Send button and click it\n9. Verify email sent (wait_for_text_ocr for 'sent' or 'message sent')"
+    elif any(keyword in user_goal_lower for keyword in ['search', 'find']):
+        flow_guidance = "\n\nSEARCH FLOW STEPS:\n1. Call get_page_source to inspect the current screen\n2. Check if a search EditText node is already visible\n3. If only a search icon/button is present, click it, then refresh get_page_source\n4. Locate the search input (class EditText) and verify it's editable\n5. Type the exact search query from the user's goal using ensure_focus_and_type or send_keys\n6. Submit the search: MANDATORY - After typing, call get_page_source to inspect the screen. Look for a search/submit button in the XML (nodes with 'search' or 'submit' in resource-id/content-desc, or Button/ImageButton elements). PREFER clicking that button to submit. FALLBACK: If no search button is found in the page source, you may use Enter key (send '\\n') as a fallback.\n7. After submitting (via button or Enter), call get_page_source again to verify search results have loaded (look for result lists, RecyclerView, or new items that appeared)\n8. Click the first result from the search results (look for clickable ViewGroup/RecyclerView/ListView items that represent actual search results, NOT app logos, navigation elements, or unrelated UI components)"
+    elif any(keyword in user_goal_lower for keyword in ['add', 'cart', 'checkout']):
+        flow_guidance = (
+            "\n\nE-COMMERCE FLOW STEPS:"
+            "\n1. Call get_page_source to list visible products (search for the exact text/resource-id)"
+            "\n2. If the exact product name is not visible, use scroll_to_element to find it"
+            "\n3. Locate the product card whose text exactly matches the user’s string (e.g., 'Sauce Labs Bike Light') and click the 'ADD TO CART' button inside that card—never a generic button from another product"
+            "\n4. Immediately verify the button flips to 'REMOVE' or the cart badge increases, then open the cart"
+            "\n5. Inside the cart, confirm the exact product name appears before proceeding"
+            "\n6. Click the checkout button"
+            "\n7. Fill form fields (firstname, lastname, zip) – verify each target is an EditText"
+            "\n8. Click Continue/Next, then click Finish/Complete"
+            "\n9. Verify the order completion screen (wait_for_text_ocr for 'thank you' or 'order complete')"
+        )
+    
+    initial_guidance = base_guidance + flow_guidance
     strict_note = "" if not expected_inputs else f"\n\nSTRICT: Use EXACT values from user: {expected_inputs}. Do NOT auto-correct or substitute."
     validation_note = ""
     if validation_map:
         validation_list = [f"'{val['text']}'" for val in validation_map.values()]
         validation_note = f"\n\n[OK] VALIDATION REQUIREMENTS: The user has explicitly requested validation for: {', '.join(validation_list)}. You MUST perform these validations when the corresponding actions complete. Use wait_for_text_ocr, wait_for_element, or assert_activity to perform validations."
     context_note = "\n\n[INFO] CONTEXT: Work with the CURRENT screen state shown above. If the goal mentions something already visible on this screen, proceed directly with that action. You don't need to navigate back or restart from the beginning."
-    perception_note = "\n\n[THINK] SCREEN STATE: The screen state above shows XML page source (fast and reliable). XML contains all structured UI elements with their text, types, and coordinates. Always use XML elements when making decisions - they are the primary source of truth for native Android apps."
+    perception_note = (
+        "\n\n[THINK] SCREEN STATE: The screen state above shows a structured page configuration (aliases, roles, and locator candidates). Treat it as the primary source of truth for native elements. Use the aliases and ranked locators when planning actions."
+        if USE_PAGE_CONFIGURATION else
+        "\n\n[THINK] SCREEN STATE: The screen state above shows the current XML page source snapshot. Treat it as the primary source of truth for native elements. Use the resource-ids, content-desc, and text directly from this XML when planning actions."
+    )
+    initial_prompt_text = (
+        f"My goal is: '{user_goal}'.{app_suggestions}{strict_note}{validation_note}\n\n"
+        f"Here is the current screen perception summary: {initial_state_block}\n\n"
+        f"{perception_note}\n\n{context_note}\n\n{initial_guidance}"
+    )
     messages = [
-        {"role": "user", "content": f"My goal is: '{user_goal}'.{app_suggestions}{strict_note}{validation_note}\n\nHere is the current screen perception summary: {initial_xml_block}\n\n{perception_note}\n\n{context_note}\n\n{initial_guidance}"}
+        {
+            "role": "user",
+            "content": build_device_context_payload(initial_prompt_text, initial_screen_state_for_payload)
+        }
     ]
+
+    # Initialize smart executor for deterministic fallbacks
+    smart_executor = SmartActionExecutor(available_functions, expected_inputs)
 
     # Build tool list for the LLM, optionally removing launch_app entirely
     if disable_launch:
@@ -1769,9 +2438,12 @@ def main(provided_goal: str | None = None):
     else:
         tools_for_model = tools_list_claude
 
-    # Cache for page source to avoid redundant calls
-    _cached_xml = None
-    _cached_xml_timestamp = 0
+    # Cache for page configuration / XML snapshots to avoid redundant calls
+    _cached_page_config = initial_config_snapshot
+    _cached_page_config_timestamp = time.time() if initial_config_snapshot else 0
+    _cached_xml = initial_xml_snapshot
+    _cached_xml_timestamp = time.time() if initial_xml_snapshot else 0
+    _previous_xml = initial_xml_snapshot
     _last_action_was_screen_change = False
     
     # Track repeated actions to prevent infinite loops
@@ -1788,18 +2460,229 @@ def main(provided_goal: str | None = None):
                     # Fallback: Parse steps from user prompt
                     user_prompt_lower = user_goal.lower()
                     inferred_steps = []
-                    # Also check for simple sequential actions
+                    step_num = 1
+
+                    def add_planned_step(name: str, description: str | None = None, match_phrases: list[str] | None = None):
+                        nonlocal step_num, inferred_steps
+                        inferred_steps.append({
+                            "step": step_num,
+                            "name": name,
+                            "description": description or name,
+                            "match_phrases": match_phrases or []
+                        })
+                        step_num += 1
+                    
+                    # App opening
                     if 'open' in user_prompt_lower:
-                        inferred_steps.append({"step": 1, "name": "Open app", "description": "Open the Swag Labs mobile application"})
+                        app_match = re.search(r'open\s+([a-z0-9 ._-]+)', user_goal, re.IGNORECASE)
+                        app_name = app_match.group(1).strip() if app_match else "app"
+                        add_planned_step(f"Open {app_name}", f"Open {app_name}")
+                    
+                    # Gmail compose / email actions
+                    if any(keyword in user_prompt_lower for keyword in ['compose', 'mail', 'email']):
+                        if 'compose' in user_prompt_lower:
+                            add_planned_step("Click Compose", "Click Compose button", ["compose"])
+                        if ' subject' in user_prompt_lower:
+                            add_planned_step("Enter subject", "Type subject", ["subject"])
+                        if ' body' in user_prompt_lower:
+                            add_planned_step("Enter body", "Type body", ["body"])
+                        if 'send' in user_prompt_lower:
+                            add_planned_step("Send email", "Click Send button", ["send"])
+                    
+                    # Login flow
                     if 'username' in user_prompt_lower:
-                        inferred_steps.append({"step": len(inferred_steps) + 1, "name": "Enter username", "description": "Enter username"})
+                        add_planned_step("Enter username", "Type username", ["username"])
                     if 'password' in user_prompt_lower:
-                        inferred_steps.append({"step": len(inferred_steps) + 1, "name": "Enter password", "description": "Enter password"})
-                    if 'login' in user_prompt_lower or 'tap' in user_prompt_lower:
-                        inferred_steps.append({"step": len(inferred_steps) + 1, "name": "Tap Login", "description": "Tap the Login button"})
+                        add_planned_step("Enter password", "Type password", ["password"])
+                    if 'login' in user_prompt_lower or 'tap login' in user_prompt_lower:
+                        add_planned_step("Tap Login", "Click Login button", ["login"])
+                    
+                    # Verify products page
+                    if 'verify' in user_prompt_lower and 'products page' in user_prompt_lower:
+                        add_planned_step(
+                            "Verify Products Page",
+                            "Wait For Text Ocr PRODUCTS",
+                            ["wait for text ocr products", "products page"]
+                        )
+                    
+                    # Detect product add instructions
+                    product_match = re.search(r'add\s+([a-z0-9\s\-]+?)\s+(?:item|product)?\s*to\s+cart', user_goal, re.IGNORECASE)
+                    if product_match:
+                        product_name = product_match.group(1).strip()
+                        add_planned_step(
+                            f"Add {product_name} to cart",
+                            f"Add {product_name} to cart",
+                            ["add to cart", product_name.lower()]
+                        )
+                        add_planned_step(
+                            f"Verify {product_name} in cart",
+                            f"Verify {product_name} appears in cart",
+                            [product_name.lower(), "cart"]
+                        )
+                    
+                    # Go to / view cart
+                    if 'go to cart' in user_prompt_lower or 'view cart' in user_prompt_lower or 'cart' in user_prompt_lower:
+                        add_planned_step("Open cart", "Go to cart", ["cart"])
+                    
+                    # Checkout sequence
+                    if 'checkout' in user_prompt_lower:
+                        add_planned_step("Proceed to checkout", "Click checkout", ["checkout"])
+                    
+                    firstname_match = re.search(r'first\s*name\s+as\s+([a-z0-9\s]+)', user_goal, re.IGNORECASE)
+                    if firstname_match:
+                        fname = firstname_match.group(1).strip()
+                        add_planned_step(
+                            f"Enter first name ({fname})",
+                            f"Type {fname} in first name",
+                            ["first name"]
+                        )
+                    
+                    lastname_match = re.search(r'last\s*name\s+as\s+([a-z0-9\s]+)', user_goal, re.IGNORECASE)
+                    if lastname_match:
+                        lname = lastname_match.group(1).strip()
+                        add_planned_step(
+                            f"Enter last name ({lname})",
+                            f"Type {lname} in last name",
+                            ["last name"]
+                        )
+                    
+                    zip_match = re.search(r'(zip|postal)\s*code\s+as\s+([a-z0-9\s]+)', user_goal, re.IGNORECASE)
+                    if zip_match:
+                        zip_value = zip_match.group(2).strip()
+                        add_planned_step(
+                            f"Enter zip code ({zip_value})",
+                            f"Type {zip_value} in zip code",
+                            ["zip", "postal"]
+                        )
+                    
+                    if 'continue' in user_prompt_lower:
+                        add_planned_step("Click Continue", "Click Continue", ["continue"])
+                    
+                    if any(keyword in user_prompt_lower for keyword in ['finish', 'finesh', 'complete order']):
+                        add_planned_step("Click Finish", "Click Finish", ["finish"])
+                    
+                    if 'verify' in user_prompt_lower and 'order' in user_prompt_lower:
+                        add_planned_step(
+                            "Verify order completion",
+                            "Verify order is placed",
+                            ["thank you", "order complete", "order is placed"]
+                        )
+                    
+                    # OTT Platform / Streaming App flows (HIGH PRIORITY - Check first)
+                    is_ott_platform = any(keyword in user_prompt_lower for keyword in [
+                        'netflix', 'hotstar', 'disney hotstar', 'prime video', 'amazon prime', 
+                        'disney+', 'disney plus', 'zee5', 'sony liv', 'voot', 'ott', 'streaming'
+                    ])
+                    
+                    if is_ott_platform:
+                        # Profile selection (common in Netflix, Hotstar)
+                        if 'profile' in user_prompt_lower:
+                            profile_match = re.search(r'profile\s+([^,]+?)(?:\s+and\s+then|$)', user_goal, re.IGNORECASE)
+                            if profile_match:
+                                profile_name = profile_match.group(1).strip()
+                                add_planned_step(f"Select profile {profile_name}", f"Switch to profile {profile_name}", ["profile", profile_name.lower()])
+                            else:
+                                # Generic profile selection if profile name not specified
+                                add_planned_step("Select profile", "Choose user profile if prompted", ["profile", "select profile"])
+                        
+                        # Content browsing / Categories
+                        if 'browse' in user_prompt_lower or 'category' in user_prompt_lower or 'genre' in user_prompt_lower:
+                            category_match = re.search(r'(?:browse|category|genre)\s+([^,]+?)(?:\s+and\s+then|$)', user_goal, re.IGNORECASE)
+                            if category_match:
+                                category_name = category_match.group(1).strip()
+                                add_planned_step(f"Browse {category_name}", f"Navigate to {category_name} category", [category_name.lower(), "category", "browse"])
+                            else:
+                                add_planned_step("Browse categories", "Navigate to browse/categories section", ["browse", "category"])
+                        
+                        # My List / Watchlist
+                        if 'my list' in user_prompt_lower or 'watchlist' in user_prompt_lower or 'saved' in user_prompt_lower:
+                            add_planned_step("Open My List", "Navigate to My List/Watchlist", ["my list", "watchlist", "saved"])
+                        
+                        # Continue Watching
+                        if 'continue watching' in user_prompt_lower or 'resume' in user_prompt_lower or 'continue' in user_prompt_lower:
+                            add_planned_step("Continue Watching", "Resume previously watched content", ["continue", "resume", "continue watching"])
+                        
+                        # TV Show / Episode selection
+                        if 'episode' in user_prompt_lower or 'season' in user_prompt_lower:
+                            season_match = re.search(r'season\s+(\d+)', user_goal, re.IGNORECASE)
+                            episode_match = re.search(r'episode\s+(\d+)', user_goal, re.IGNORECASE)
+                            if season_match:
+                                season_num = season_match.group(1)
+                                add_planned_step(f"Select Season {season_num}", f"Navigate to Season {season_num}", ["season", season_num])
+                            if episode_match:
+                                episode_num = episode_match.group(1)
+                                add_planned_step(f"Select Episode {episode_num}", f"Navigate to Episode {episode_num}", ["episode", episode_num])
+                            elif 'episode' in user_prompt_lower or 'season' in user_prompt_lower:
+                                add_planned_step("Select episode", "Navigate to episode selection", ["episode", "season"])
+                        
+                        # Search in OTT platforms
+                        if 'search' in user_prompt_lower:
+                            search_match = re.search(r'search\s+for\s+([^,]+?)(?:\s+and\s+then|$)', user_goal, re.IGNORECASE)
+                            if search_match:
+                                search_query = search_match.group(1).strip()
+                                add_planned_step("Click Search", "Click search icon/button", ["search"])
+                                add_planned_step(f"Search for {search_query}", f"Type search query: {search_query}", [search_query.lower(), "search"])
+                                add_planned_step("Submit search", "Click search button or submit", ["submit", "search button"])
+                        
+                        # Play content (OTT-specific)
+                        if 'play' in user_prompt_lower:
+                            if 'movie' in user_prompt_lower:
+                                movie_match = re.search(r'play\s+(?:the\s+)?movie\s+([^,]+?)(?:\s+and\s+then|$)', user_goal, re.IGNORECASE)
+                                if movie_match:
+                                    movie_name = movie_match.group(1).strip()
+                                    add_planned_step(f"Play movie {movie_name}", f"Select and play {movie_name}", ["movie", movie_name.lower(), "play", "watch", "resume"])
+                                else:
+                                    add_planned_step("Play movie", "Select and play a movie", ["movie", "play", "watch", "resume"])
+                            elif 'show' in user_prompt_lower or 'series' in user_prompt_lower:
+                                show_match = re.search(r'play\s+(?:the\s+)?(?:show|series)\s+([^,]+?)(?:\s+and\s+then|$)', user_goal, re.IGNORECASE)
+                                if show_match:
+                                    show_name = show_match.group(1).strip()
+                                    add_planned_step(f"Play show {show_name}", f"Select and play {show_name}", ["show", "series", show_name.lower(), "play", "watch", "resume"])
+                                else:
+                                    add_planned_step("Play show", "Select and play a show", ["show", "series", "play", "watch", "resume"])
+                            elif 'first' in user_prompt_lower:
+                                add_planned_step("Play first result", "Click first search/browse result", ["first", "play", "video", "watch", "resume"])
+                            else:
+                                add_planned_step("Play content", "Click content to play", ["play", "video", "watch", "resume"])
+                    
+                    # YouTube / Video search and play flow (fallback for non-OTT video apps)
+                    elif 'search' in user_prompt_lower and ('youtube' in user_prompt_lower or 'video' in user_prompt_lower):
+                        search_match = re.search(r'search\s+for\s+([^,]+?)(?:\s+and\s+then|$)', user_goal, re.IGNORECASE)
+                        if search_match:
+                            search_query = search_match.group(1).strip()
+                            add_planned_step("Click Search", "Click search icon/button", ["search"])
+                            add_planned_step(f"Search for {search_query}", f"Type search query: {search_query}", [search_query.lower(), "search"])
+                            add_planned_step("Submit search", "Click search button or submit", ["submit", "search button"])
+                    
+                    if 'play' in user_prompt_lower and not is_ott_platform and ('first' in user_prompt_lower or 'video' in user_prompt_lower):
+                        if 'first' in user_prompt_lower:
+                            add_planned_step("Play first video", "Click first search result video", ["first", "video", "play", "watch", "resume"])
+                        else:
+                            add_planned_step("Play video", "Click video to play", ["video", "play", "watch", "resume"])
+
+                    # Downloads / offline playback flows
+                    if 'download' in user_prompt_lower:
+                        add_planned_step(
+                            "Open Downloads",
+                            "Navigate to downloads/offline section",
+                            ["download", "downloads"]
+                        )
+                        if (('second' in user_prompt_lower) or ('2nd' in user_prompt_lower)) and any(keyword in user_prompt_lower for keyword in ['video', 'episode', 'item', 'content']):
+                            add_planned_step(
+                                "Play second downloaded video",
+                                "Open and play the second downloaded item/video",
+                                ["second", "2nd", "download", "tag_download_content_item", "video", "downloads", "watch", "resume", "play"]
+                            )
+                        elif 'play' in user_prompt_lower:
+                            add_planned_step(
+                                "Play downloaded content",
+                                "Open downloaded item",
+                                ["download", "downloads", "offline", "play", "watch", "resume"]
+                            )
                     
                     if inferred_steps:
                         main._planned_steps = inferred_steps
+                        print(f"[DEBUG] Inferred {len(inferred_steps)} steps from user prompt: {[s.get('name') for s in inferred_steps]}")
                 
                 # Check 1: Verify if all planned steps have been executed
                 all_steps_completed = False
@@ -1818,6 +2701,11 @@ def main(provided_goal: str | None = None):
                             plan_desc_normalized = plan_desc.lower().strip()
                             found_match = False
                             for exec_desc in executed_descriptions:
+                                match_phrases = planned_step.get('match_phrases') or []
+                                if match_phrases:
+                                    if any(phrase for phrase in match_phrases if phrase and phrase in exec_desc):
+                                        found_match = True
+                                        break
                                 plan_keywords = set(plan_desc_normalized.split())
                                 exec_keywords = set(exec_desc.split())
                                 if len(plan_keywords & exec_keywords) >= min(2, len(plan_keywords) // 2):
@@ -1830,17 +2718,19 @@ def main(provided_goal: str | None = None):
                     if all_executed and test_report.report.get("failed_steps", 0) == 0:
                         all_steps_completed = True
                 
-                # Check 2: Check for completion page indicators (after finish/complete actions)
+                # Check 2: Check for completion page indicators (ONLY after finish/complete actions)
                 recent_steps = test_report.report.get('steps', [])[-5:]  # Check last 5 steps
                 recent_descriptions = [s.get('description', '').lower() for s in recent_steps]
                 clicked_completion_action = any(
                     keyword in desc for desc in recent_descriptions 
-                    for keyword in ['finish', 'complete', 'submit', 'done', 'confirm', 'order complete']
+                    for keyword in ['finish', 'complete', 'submit', 'done', 'confirm', 'order complete', 'send', 'sent']
                 )
                 
+                # FIX: Only check completion page if we actually clicked a completion action
+                # This prevents false positives from intermediate screens (like Gmail compose)
                 if clicked_completion_action or all_steps_completed:
                     # Check if we're on a completion page
-                    check_xml_result = get_page_source()
+                    check_xml_result = get_page_source_guarded("completion check")
                     check_xml = None
                     if isinstance(check_xml_result, str):
                         check_xml = check_xml_result
@@ -1849,161 +2739,218 @@ def main(provided_goal: str | None = None):
                     
                     if check_xml:
                         xml_lower = check_xml.lower()
+                        # FIX: More specific completion indicators to avoid false positives
+                        # Generic words like "complete" or "success" can appear in intermediate screens
                         completion_indicators = [
                             'thank you for your order',
                             'order complete',
                             'checkout complete',
+                            'message sent',  # Gmail-specific
+                            'email sent',    # Gmail-specific
+                            'sent successfully',  # Generic
                             'back home',
                             'thank you',
-                            'complete',
-                            'success',
-                            'done',
-                            'finished'
+                            'order confirmation',  # More specific
+                            'transaction complete',  # More specific
+                            'payment complete',  # More specific
+                            'player',  # Video player (YouTube, etc.)
+                            'video player',  # Video player
+                            'playing',  # Video is playing
+                            'pause',  # Video controls visible (indicates video is playing)
+                            'fullscreen',  # Video fullscreen button
                         ]
                         is_completion_page = any(indicator in xml_lower for indicator in completion_indicators)
                         
-                        # If all steps completed OR we're on completion page, stop
-                        if all_steps_completed or is_completion_page:
-                            if all_steps_completed:
-                                print("\n[INFO]  Completion detected: All planned steps have been executed.")
-                            if is_completion_page:
-                                print("\n[INFO]  Completion detected: Reached completion page.")
-                            print("[INFO]  All steps from user prompt have been completed successfully.")
-                            print("[INFO]  Stopping automation and generating report...")
+                        # Check for video playing scenarios (OTT platforms and YouTube)
+                        # If user goal includes "play" and we see video player controls, consider it complete
+                        is_video_playing = False
+                        is_ott_platform = any(keyword in user_goal.lower() for keyword in [
+                            'netflix', 'hotstar', 'disney hotstar', 'prime video', 'amazon prime',
+                            'disney+', 'disney plus', 'zee5', 'sony liv', 'voot', 'ott', 'streaming',
+                            'movie', 'show', 'episode', 'series'
+                        ])
+                        
+                        if 'play' in user_goal.lower() and (is_ott_platform or 'video' in user_goal.lower() or 'youtube' in user_goal.lower()):
+                            # Enhanced video indicators for OTT platforms
+                            video_indicators = [
+                                'player', 'video player', 'pause', 'fullscreen', 'seek bar', 
+                                'playback controls', 'subtitle', 'audio track', 'quality',
+                                'episode', 'season', 'next episode', 'previous episode',
+                                'playback speed', 'skip intro', 'skip credits', 'resume',
+                                'movie player', 'show player', 'streaming player'
+                            ]
+                            is_video_playing = any(indicator in xml_lower for indicator in video_indicators)
                             
-                            report_filename = test_report.finalize("completed")
-                            print(f"\n[REPORT] Report: {report_filename}")
-                            print(f"[STATS] {test_report.get_summary()}")
+                            # Also check if we recently clicked content (last 3 steps)
+                            recent_steps_for_video = test_report.report.get('steps', [])[-3:]
+                            clicked_content = any(
+                                'video' in desc or 
+                                'play' in desc or
+                                'movie' in desc or
+                                'show' in desc or
+                                'episode' in desc or
+                                'resume' in desc or
+                                'watch' in desc
+                                for desc in (s.get('description', '').lower() for s in recent_steps_for_video)
+                            )
+                            
+                            if is_video_playing and clicked_content:
+                                platform_type = "OTT platform" if is_ott_platform else "video platform"
+                                finalize_and_generate_report(
+                                    test_report, 
+                                    "completed", 
+                                    None,
+                                    f"Content playing detected on {platform_type}"
+                                )
+                                break
+                        
+                        # FIX: Require BOTH conditions for completion page detection:
+                        # 1. We clicked a completion action (finish, send, submit, etc.)
+                        # 2. AND we're on an actual completion page
+                        # OR all steps are explicitly completed
+                        if all_steps_completed or (clicked_completion_action and is_completion_page):
+                            completion_msg = None
+                            if all_steps_completed:
+                                completion_msg = "All planned steps have been executed successfully."
+                            elif clicked_completion_action and is_completion_page:
+                                completion_msg = "Reached completion page after completion action."
+                            
+                            finalize_and_generate_report(
+                                test_report,
+                                "completed",
+                                None,
+                                completion_msg
+                            )
                             break
                 
                 # Check 3: If we've hit the max action cycles and no failures, assume completion
                 if action_cycle_count >= MAX_ACTION_CYCLES:
                     failed_steps = test_report.report.get("failed_steps", 0)
                     if failed_steps == 0:
-                        print(f"\n[INFO]  Maximum action cycles ({MAX_ACTION_CYCLES}) reached.")
-                        print("[INFO]  Assuming completion and generating report...")
-                        report_filename = test_report.finalize("completed", "Reached maximum action cycle limit")
-                        print(f"\n[REPORT] Report: {report_filename}")
-                        print(f"[STATS] {test_report.get_summary()}")
+                        finalize_and_generate_report(
+                            test_report,
+                            "completed",
+                            None,
+                            f"Reached maximum action cycle limit ({MAX_ACTION_CYCLES})"
+                        )
                         break
             except Exception as e:
                 # If check fails, continue normally
                 pass
         
         # Only get fresh perception summary if screen likely changed (after actions)
-        # Otherwise, use cached XML for speed
-        if _last_action_was_screen_change or _cached_xml is None:
-            print("\n--- [THINK] OBSERVE: Getting page source (XML only - fast mode)...")
-            try:
-                # Fast path: XML only (skip OCR for speed)
-                xml_result = get_page_source()
-                # Handle both string (success) and dict (error) returns
-                if isinstance(xml_result, dict):
-                    if xml_result.get('success'):
-                        current_screen_xml = xml_result.get('value', '')
-                    else:
-                        # Check if session crashed
-                        error_msg = xml_result.get('error', '')
-                        if 'instrumentation process is not running' in error_msg.lower() or 'cannot be proxied to uiautomator2' in error_msg.lower():
-                            print("\n[WARN]  Appium session crashed. Attempting recovery...")
-                            # Try to recover session
-                            import appium_tools
-                            if hasattr(appium_tools, '_try_recover_session'):
-                                recovered = appium_tools._try_recover_session()
-                                if recovered:
-                                    # Retry getting page source
-                                    time.sleep(2)
-                                    xml_result = get_page_source()
-                                    if isinstance(xml_result, dict) and xml_result.get('success'):
-                                        current_screen_xml = xml_result.get('value', '')
-                                    else:
-                                        print("[ERROR] Failed to get page source after session recovery.")
-                                        # Add skipped steps and finalize report
-                                        add_skipped_steps_if_needed(test_report, test_report.step_counter)
-                                        report_filename = test_report.finalize("error", "Appium session crashed and recovery failed")
-                                        print(f"\n[REPORT] Report: {report_filename}")
-                                        print(f"[STATS] {test_report.get_summary()}")
-                                        break
-                                else:
-                                    print("[ERROR] Session recovery failed. Stopping automation.")
-                                    add_skipped_steps_if_needed(test_report, test_report.step_counter)
-                                    report_filename = test_report.finalize("error", "Appium session crashed and recovery failed")
-                                    print(f"\n[REPORT] Report: {report_filename}")
-                                    print(f"[STATS] {test_report.get_summary()}")
-                                    break
-                            else:
-                                print("[ERROR] Session recovery not available. Stopping automation.")
-                                add_skipped_steps_if_needed(test_report, test_report.step_counter)
-                                report_filename = test_report.finalize("error", "Appium session crashed")
-                                print(f"\n[REPORT] Report: {report_filename}")
-                                print(f"[STATS] {test_report.get_summary()}")
-                                break
+        if USE_PAGE_CONFIGURATION:
+            used_cached_snapshot = False
+            if _last_action_was_screen_change or _cached_page_config is None:
+                print("\n--- [THINK] OBSERVE: Generating page configuration snapshot...")
+                try:
+                    config_result = get_page_configuration_guarded("observing screen")
+                    summary_text, payload_text = render_config_state(config_result)
+                    snapshot_payload = payload_text or summary_text
+                    if not summary_text:
+                        summary_text = "[WARN] Page configuration not available."
+                    if not snapshot_payload:
+                        snapshot_payload = summary_text
+                    _cached_page_config = {"summary": summary_text, "payload": snapshot_payload}
+                    _cached_page_config_timestamp = time.time()
+                    _last_action_was_screen_change = False
+                except Exception as e:
+                    print(f"[WARN]  Failed to get page configuration: {e}")
+                    summary_text = "[Unable to get page configuration]"
+                    snapshot_payload = ""
+                    _cached_page_config = {"summary": summary_text, "payload": snapshot_payload}
+            else:
+                used_cached_snapshot = True
+                print("\n--- [THINK] OBSERVE: Using cached page configuration (screen unchanged)...")
+                summary_text = (_cached_page_config or {}).get('summary', '')
+                snapshot_payload = (_cached_page_config or {}).get('payload', summary_text)
+            
+            dynamic_context_limit = get_dynamic_xml_length(len(messages) + 1)
+            truncated_summary = truncate_text_block(summary_text, dynamic_context_limit)
+            truncated_payload = truncate_text_block(snapshot_payload, dynamic_context_limit)
+            summary_label = "Page Configuration Summary (cached)" if used_cached_snapshot else "Page Configuration Summary"
+            current_perception_block = f"[{summary_label}]:\n{truncated_summary}"
+            
+            # Add explicit reminder to check configuration before scrolling
+            user_goal_lower = user_goal.lower()
+            key_terms = []
+            if 'add' in user_goal_lower and 'cart' in user_goal_lower:
+                product_match = re.search(r'add\s+([^to]+?)\s+to\s+cart', user_goal_lower)
+                if product_match:
+                    key_terms.append(product_match.group(1).strip())
+            if 'bike light' in user_goal_lower:
+                key_terms.append('bike light')
+            if 'backpack' in user_goal_lower:
+                key_terms.append('backpack')
+            
+            if key_terms:
+                current_perception_block += f"\n\n[CRITICAL REMINDER] Before scrolling, SEARCH the page configuration above for: {', '.join(key_terms)}. If found, act on it directly—do NOT scroll!"
+            
+            screen_state_for_payload = truncated_payload
+        else:
+            # Use XML snapshots with caching/diff
+            if _last_action_was_screen_change or _cached_xml is None:
+                print("\n--- [THINK] OBSERVE: Getting page source (XML only - fast mode)...")
+                try:
+                    xml_result = get_page_source_guarded("observing screen")
+                    if isinstance(xml_result, dict):
+                        if xml_result.get('success'):
+                            current_screen_xml = xml_result.get('value', '')
                         else:
                             current_screen_xml = f"[Error getting page source: {xml_result.get('error', 'Unknown error')}]"
-                else:
-                    current_screen_xml = xml_result
-                # Apply cost optimizations
+                    else:
+                        current_screen_xml = xml_result
+                    if USE_XML_COMPRESSION:
+                        current_screen_xml = compress_xml(current_screen_xml)
+                    
+                    _cached_xml = current_screen_xml
+                    _cached_xml_timestamp = time.time()
+                    _last_action_was_screen_change = False
+                    
+                    if _previous_xml and _previous_xml != current_screen_xml:
+                        diff_xml = get_xml_diff(_previous_xml, current_screen_xml)
+                        dynamic_xml_limit = get_dynamic_xml_length(len(messages) + 1)
+                        truncated_current_xml = truncate_xml(diff_xml, dynamic_xml_limit)
+                        current_perception_block = f"[XML Page Source (diff, compressed)]:\n{truncated_current_xml}"
+                    else:
+                        dynamic_xml_limit = get_dynamic_xml_length(len(messages) + 1)
+                        truncated_current_xml = truncate_xml(current_screen_xml, dynamic_xml_limit)
+                        current_perception_block = f"[XML Page Source (compressed)]:\n{truncated_current_xml}"
+                    
+                    _previous_xml = current_screen_xml
+                except Exception as e:
+                    print(f"[WARN]  Failed to get page source: {e}")
+                    current_perception_block = "[Unable to get page source]"
+                    truncated_current_xml = ""
+            else:
+                print("\n--- [THINK] OBSERVE: Using cached page source (screen unchanged)...")
+                cached_xml = _cached_xml or ""
                 if USE_XML_COMPRESSION:
-                    current_screen_xml = compress_xml(current_screen_xml)
-                
-                _cached_xml = current_screen_xml
-                _cached_xml_timestamp = time.time()
-                _last_action_was_screen_change = False
-                
-                # Use incremental diff if enabled and we have previous XML
-                if USE_XML_DIFF and _previous_xml and _previous_xml != current_screen_xml:
-                    diff_xml = get_xml_diff(_previous_xml, current_screen_xml)
-                    dynamic_xml_limit = get_dynamic_xml_length(len(messages) + 1)
-                    truncated_current_xml = truncate_xml(diff_xml, dynamic_xml_limit)
-                    current_perception_block = f"[XML Page Source (diff, compressed)]:\n{truncated_current_xml}"
-                else:
-                    # Use dynamic XML length based on current message count
-                    dynamic_xml_limit = get_dynamic_xml_length(len(messages) + 1)
-                    truncated_current_xml = truncate_xml(current_screen_xml, dynamic_xml_limit)
-                    current_perception_block = f"[XML Page Source (compressed)]:\n{truncated_current_xml}"
-                
-                # Update previous XML for next diff
-                _previous_xml = current_screen_xml
-            except Exception as e:
-                print(f"[WARN]  Failed to get page source: {e}")
-                current_perception_block = "[Unable to get page source]"
-        else:
-            # Use cached XML - screen hasn't changed
-            print("\n--- [THINK] OBSERVE: Using cached page source (screen unchanged)...")
-            # Apply compression to cached XML if enabled
-            cached_xml = _cached_xml
-            if USE_XML_COMPRESSION:
-                cached_xml = compress_xml(cached_xml)
-            # Use dynamic XML length based on current message count
-            dynamic_xml_limit = get_dynamic_xml_length(len(messages) + 1)
-            truncated_current_xml = truncate_xml(cached_xml, dynamic_xml_limit)
-            current_perception_block = f"[XML Page Source (cached, compressed)]:\n{truncated_current_xml}"
-        
-        # Add explicit reminder to check XML before scrolling
-        # Extract key terms from user goal to help LLM search XML
-        import re
-        user_goal_lower = user_goal.lower()
-        key_terms = []
-        # Look for product names, actions, etc.
-        if 'add' in user_goal_lower and 'cart' in user_goal_lower:
-            # Extract product name if mentioned
-            product_match = re.search(r'add\s+([^to]+?)\s+to\s+cart', user_goal_lower)
-            if product_match:
-                key_terms.append(product_match.group(1).strip())
-        if 'bike light' in user_goal_lower:
-            key_terms.append('bike light')
-        if 'backpack' in user_goal_lower:
-            key_terms.append('backpack')
-        
-        if key_terms:
-            xml_reminder = f"\n\n[CRITICAL REMINDER] Before scrolling, SEARCH the XML above for: {', '.join(key_terms)}. If found, use it directly - DO NOT scroll!"
-            current_perception_block += xml_reminder
-        
-        # Add current page source to messages so LLM can see what's on screen
-        # This ensures LLM always has the latest screen state before making decisions
+                    cached_xml = compress_xml(cached_xml)
+                dynamic_xml_limit = get_dynamic_xml_length(len(messages) + 1)
+                truncated_current_xml = truncate_xml(cached_xml, dynamic_xml_limit)
+                current_perception_block = f"[XML Page Source (cached, compressed)]:\n{truncated_current_xml}"
+            
+            # Reminder for key terms
+            user_goal_lower = user_goal.lower()
+            key_terms = []
+            if 'add' in user_goal_lower and 'cart' in user_goal_lower:
+                product_match = re.search(r'add\s+([^to]+?)\s+to\s+cart', user_goal_lower)
+                if product_match:
+                    key_terms.append(product_match.group(1).strip())
+            if 'bike light' in user_goal_lower:
+                key_terms.append('bike light')
+            if 'backpack' in user_goal_lower:
+                key_terms.append('backpack')
+            
+            if key_terms:
+                current_perception_block += f"\n\n[CRITICAL REMINDER] Before scrolling, SEARCH the XML above for: {', '.join(key_terms)}. If found, use it directly—DO NOT scroll!"
+            
+            screen_state_for_payload = truncated_current_xml if isinstance(truncated_current_xml, str) else ""
+        # Add current page configuration + metadata payload for LLM
         messages.append({
             "role": "user",
-            "content": current_perception_block
+            "content": build_device_context_payload(current_perception_block, screen_state_for_payload)
         })
         
         print("--- [THINK] THINK: Asking LLM what to do next...")
@@ -2015,43 +2962,41 @@ def main(provided_goal: str | None = None):
             messages = []
         
         # Prune messages more aggressively to prevent "Input is too long" errors
-        # Start pruning earlier and more aggressively
+        # Start pruning when approaching the limit
         current_message_count = len(messages)
-        if current_message_count > 10:
-            # Prune when we have more than 10 messages
-            target_messages = MAX_MESSAGES - 2 if current_message_count > 12 else MAX_MESSAGES
+        if current_message_count > 20:
+            # Prune when we have more than 20 messages (2/3 of MAX_MESSAGES)
+            target_messages = MAX_MESSAGES - 2 if current_message_count > MAX_MESSAGES - 5 else MAX_MESSAGES
             messages = prune_messages(messages, target_messages)
         
-        # Also reduce XML size in existing messages based on current message count
-        # This prevents accumulation of large XML content across multiple messages
+        # Also reduce page configuration summary size in existing messages to control context growth
         dynamic_xml_limit = get_dynamic_xml_length(len(messages))
         if dynamic_xml_limit < MAX_XML_LENGTH:
-            # Reduce XML size in all messages that contain XML
+            # Reduce page configuration text in all messages that contain it
             for msg in messages:
-                if isinstance(msg.get('content'), str) and '[XML' in msg['content']:
-                    # Extract and re-truncate XML if present
+                if isinstance(msg.get('content'), str) and '[Page Configuration' in msg['content']:
+                    # Extract and re-truncate configuration text if present
                     import re
-                    xml_match = re.search(r'\[XML[^\]]*\]:\s*(.*?)(?=\n\n|\Z)', msg['content'], re.DOTALL)
-                    if xml_match:
-                        xml_content = xml_match.group(1)
-                        if len(xml_content) > dynamic_xml_limit:
-                            truncated_xml = truncate_xml(xml_content, dynamic_xml_limit)
-                            msg['content'] = msg['content'].replace(xml_content, truncated_xml)
+                    cfg_match = re.search(r'\[Page Configuration[^\]]*\]:\s*(.*?)(?=\n\n|\Z)', msg['content'], re.DOTALL)
+                    if cfg_match:
+                        cfg_content = cfg_match.group(1)
+                        if len(cfg_content) > dynamic_xml_limit:
+                            truncated_cfg = truncate_text_block(cfg_content, dynamic_xml_limit)
+                            msg['content'] = msg['content'].replace(cfg_content, truncated_cfg)
                 elif isinstance(msg.get('content'), list):
                     # Handle list content (tool_result format)
                     for block in msg['content']:
                         if isinstance(block, dict) and block.get('type') == 'text':
                             text_content = block.get('text', '')
-                            if '[XML' in text_content:
-                                xml_match = re.search(r'\[XML[^\]]*\]:\s*(.*?)(?=\n\n|\Z)', text_content, re.DOTALL)
-                                if xml_match:
-                                    xml_content = xml_match.group(1)
-                                    if len(xml_content) > dynamic_xml_limit:
-                                        truncated_xml = truncate_xml(xml_content, dynamic_xml_limit)
-                                        block['text'] = text_content.replace(xml_content, truncated_xml)
+                            if '[Page Configuration' in text_content:
+                                cfg_match = re.search(r'\[Page Configuration[^\]]*\]:\s*(.*?)(?=\n\n|\Z)', text_content, re.DOTALL)
+                                if cfg_match:
+                                    cfg_content = cfg_match.group(1)
+                                    if len(cfg_content) > dynamic_xml_limit:
+                                        truncated_cfg = truncate_text_block(cfg_content, dynamic_xml_limit)
+                                        block['text'] = text_content.replace(cfg_content, truncated_cfg)
         
         # Calculate and log input size for debugging
-        import json
         system_prompt_size = len(system_prompt)
         system_prompt_lines = system_prompt.count('\n') + 1
         
@@ -2096,11 +3041,17 @@ def main(provided_goal: str | None = None):
                 request_body, 
                 BEDROCK_MODEL_ID,
                 max_retries=3,
-                base_delay=0.5  # Optimized: Reduced to 0.5s for faster retries
+                base_delay=0.2  # Optimized: Reduced to 0.2s for faster retries (Claude Desktop speed)
             )
             
             response_body = json.loads(response['body'].read().decode('utf-8'))
             stop_reason = response_body.get('stop_reason')
+            
+            # DEBUG: Log stop_reason to help diagnose infinite loops
+            if stop_reason:
+                print(f"--- [DEBUG] LLM stop_reason: {stop_reason}")
+            else:
+                print(f"--- [WARN] LLM response missing stop_reason. Response keys: {list(response_body.keys())}")
             
             # Check for API errors in response
             if 'error' in response_body:
@@ -2108,9 +3059,12 @@ def main(provided_goal: str | None = None):
                 print(f"[ERROR] API returned an error: {error_msg}")
                 # Add skipped steps before finalizing
                 add_skipped_steps_if_needed(test_report, test_report.step_counter)
-                report_filename = test_report.finalize("error", f"API error: {error_msg}")
-                print(f"\n[REPORT] Report: {report_filename}")
-                print(f"[STATS] {test_report.get_summary()}")
+                finalize_and_generate_report(
+                    test_report,
+                    "error",
+                    f"API error: {error_msg}",
+                    "Automation stopped due to API error."
+                )
                 break
             # Capture LLM Test Plan JSON once if provided in text blocks
             if not hasattr(main, '_planned_steps'):
@@ -2174,18 +3128,21 @@ def main(provided_goal: str | None = None):
             if action_cycle_count > MAX_ACTION_CYCLES:
                 failed_steps = test_report.report.get("failed_steps", 0)
                 if failed_steps == 0:
-                    print(f"\n[WARN]  Maximum action cycles ({MAX_ACTION_CYCLES}) reached.")
-                    print("[INFO]  Forcing completion and generating report...")
-                    report_filename = test_report.finalize("completed", "Reached maximum action cycle limit")
-                    print(f"\n[REPORT] Report: {report_filename}")
-                    print(f"[STATS] {test_report.get_summary()}")
+                    finalize_and_generate_report(
+                        test_report,
+                        "completed",
+                        None,
+                        f"Reached maximum action cycle limit ({MAX_ACTION_CYCLES})"
+                    )
                     break
                 else:
-                    print(f"\n[WARN]  Maximum action cycles ({MAX_ACTION_CYCLES}) reached with {failed_steps} failed step(s).")
                     add_skipped_steps_if_needed(test_report, test_report.step_counter)
-                    report_filename = test_report.finalize("failed", f"Reached maximum cycles with {failed_steps} failed step(s)")
-                    print(f"\n[REPORT] Report: {report_filename}")
-                    print(f"[STATS] {test_report.get_summary()}")
+                    finalize_and_generate_report(
+                        test_report,
+                        "failed",
+                        f"Reached maximum cycles with {failed_steps} failed step(s)",
+                        f"Maximum action cycles ({MAX_ACTION_CYCLES}) reached with failures."
+                    )
                     break
             
             if stop_reason == "tool_use":
@@ -2229,9 +3186,12 @@ def main(provided_goal: str | None = None):
                         print(f"[ERROR] Too many tool_use errors ({main._tool_use_error_count}), stopping automation.")
                         # Add skipped steps before finalizing
                         add_skipped_steps_if_needed(test_report, test_report.step_counter)
-                        report_filename = test_report.finalize("error", "Stop reason was 'tool_use' but no tool call block was found (multiple attempts)")
-                        print(f"\n[REPORT] Report: {report_filename}")
-                        print(f"[STATS] {test_report.get_summary()}")
+                        finalize_and_generate_report(
+                            test_report,
+                            "error",
+                            "Stop reason was 'tool_use' but no tool call block was found (multiple attempts)",
+                            "Automation stopped due to tool_use error."
+                        )
                         break
                     else:
                         print(f"[WARN] Retrying after tool_use error (attempt {main._tool_use_error_count})...")
@@ -2244,6 +3204,10 @@ def main(provided_goal: str | None = None):
                 # Reset error count on successful tool_use
                 if hasattr(main, '_tool_use_error_count'):
                     main._tool_use_error_count = 0
+                
+                # Reset end_turn counter when LLM actually uses a tool (shows it's making progress)
+                if hasattr(main, '_end_turn_count'):
+                    main._end_turn_count = 0
                 
                 # Detect infinite loops: check if same action is repeated too many times
                 action_signature = (function_name, str(function_args.get('strategy', '')), str(function_args.get('value', '')))
@@ -2273,8 +3237,8 @@ def main(provided_goal: str | None = None):
                         guidance_msg = (
                             f"CRITICAL: You have scrolled to '{scroll_value}' {len(recent_same_scrolls)} times. "
                             f"This is an infinite loop. The element is already visible. You MUST:\n"
-                            f"1. Call `get_page_source` to see current screen\n"
-                            f"2. Find the 'ADD TO CART' button for '{scroll_value}' in the XML\n"
+                            f"1. Call `get_page_configuration` to refresh the current screen summary\n"
+                            f"2. Find the 'ADD TO CART' alias for '{scroll_value}' in the configuration\n"
                             f"3. Click the 'ADD TO CART' button\n"
                             f"DO NOT call scroll_to_element again for this element."
                         )
@@ -2325,10 +3289,12 @@ def main(provided_goal: str | None = None):
                         error_msg = f"Infinite loop detected: '{function_name}' action repeated {recent_same_actions} times. Element may not exist or be reachable. Please verify the user's prompt is correct."
                         # Add skipped steps before finalizing
                         add_skipped_steps_if_needed(test_report, test_report.step_counter)
-                        report_filename = test_report.finalize("failed", error_msg)
-                        print(f"\n[WARN]  Test stopped at Step {step_number} after {recent_same_actions} repeated attempts.")
-                        print(f"[REPORT] Report: {report_filename}")
-                        print(f"[STATS] {test_report.get_summary()}")
+                        finalize_and_generate_report(
+                            test_report,
+                            "failed",
+                            error_msg,
+                            f"Test stopped at Step {step_number} after {recent_same_actions} repeated attempts."
+                        )
                         break
                 
                 # Track this action
@@ -2336,41 +3302,20 @@ def main(provided_goal: str | None = None):
                 if len(_action_history) > 10:  # Keep only last 10 actions
                     _action_history.pop(0)
                 
+                # Initialize error flag for this iteration before any completion checks
+                is_error = False
+                
                 # COMPLETION CHECK: After each action, check if all steps are complete
                 # This prevents continuing after completion even if LLM doesn't return end_turn
                 # Also check if we're repeating actions (indicates we're done but stuck)
                 if action_cycle_count > 2 and not is_error:
                     try:
-                        # Check for repeated actions (trying same thing again = we're done)
-                        if len(_action_history) >= 3:
-                            recent_actions = _action_history[-3:]
-                            # If last 3 actions are the same, we might be stuck
-                            if len(set(recent_actions)) == 1:
-                                # Check if we've completed login steps
-                                recent_descriptions = [s.get('description', '').lower() for s in test_report.report.get('steps', [])[-5:]]
-                                has_login_completed = any('login' in desc and 'click' in desc for desc in recent_descriptions)
-                                has_username_entered = any('username' in desc for desc in recent_descriptions)
-                                has_password_entered = any('password' in desc for desc in recent_descriptions)
-                                
-                                # If we've done login and are repeating, we're done
-                                if has_login_completed and has_username_entered and has_password_entered:
-                                    print("\n[INFO]  Completion detected: Login completed and actions are repeating.")
-                                    print("[INFO]  All steps from user prompt have been completed successfully.")
-                                    print("[INFO]  Stopping automation and generating report...")
-                                    
-                                    report_filename = test_report.finalize("completed")
-                                    print(f"\n[REPORT] Report: {report_filename}")
-                                    print(f"[STATS] {test_report.get_summary()}")
-                                    break
-                        
-                        # Quick check: If we have planned steps and all are executed, stop
+                        # Completion guardrail: only rely on explicit planned steps
                         if hasattr(main, '_planned_steps') and isinstance(main._planned_steps, list) and len(main._planned_steps) > 0:
                             executed_count = len([s for s in test_report.report.get('steps', []) if s.get('status') != 'SKIPPED'])
                             failed_count = test_report.report.get("failed_steps", 0)
                             
-                            # If we have executed steps and no failures, check if all planned steps are done
                             if executed_count >= len(main._planned_steps) and failed_count == 0:
-                                # Verify all planned steps were actually executed (not just count match)
                                 executed_descriptions = set()
                                 for step_info in test_report.report.get('steps', []):
                                     desc = step_info.get('description', '')
@@ -2384,6 +3329,11 @@ def main(provided_goal: str | None = None):
                                         plan_desc_normalized = plan_desc.lower().strip()
                                         found_match = False
                                         for exec_desc in executed_descriptions:
+                                            match_phrases = planned_step.get('match_phrases') or []
+                                            if match_phrases:
+                                                if any(phrase for phrase in match_phrases if phrase and phrase in exec_desc):
+                                                    found_match = True
+                                                    break
                                             plan_keywords = set(plan_desc_normalized.split())
                                             exec_keywords = set(exec_desc.split())
                                             if len(plan_keywords & exec_keywords) >= min(2, len(plan_keywords) // 2):
@@ -2394,11 +3344,12 @@ def main(provided_goal: str | None = None):
                                             break
                                 
                                 if all_executed:
-                                    print("\n[INFO]  Completion detected: All planned steps have been executed.")
-                                    print("[INFO]  Stopping automation and generating report...")
-                                    report_filename = test_report.finalize("completed")
-                                    print(f"\n[REPORT] Report: {report_filename}")
-                                    print(f"[STATS] {test_report.get_summary()}")
+                                    finalize_and_generate_report(
+                                        test_report,
+                                        "completed",
+                                        None,
+                                        "All planned steps have been executed successfully."
+                                    )
                                     break
                     except Exception:
                         # If check fails, continue normally
@@ -2410,32 +3361,20 @@ def main(provided_goal: str | None = None):
                 # Don't increment step number or print for get_page_source (it's an internal observation step)
                 if function_name != 'get_page_source':
                     step_number += 1
-                    # Suppress technical message - not shown to users
-                    # print(f"\n--- [BOT] LLM Decision: Call {function_name} with args: {function_args}")
-                    print(f"Step {step_number}: {step_description}")
+                    # Format tool call in Claude Desktop style
+                    tool_name_display = function_name.replace('_', '-').title()
+                    print(f"\n[TOOL_CALL] {tool_name_display}")
+                    print(f"[TOOL_REQUEST] {json.dumps(function_args, indent=2)}")
                 
                 # Auto-hide keyboard before clicking buttons (especially if previous action was send_keys)
                 if function_name == 'click':
-                    # Check if previous action was send_keys (keyboard likely visible)
-                    if hasattr(main, '_last_action_type') and main._last_action_type in ('send_keys', 'ensure_focus_and_type'):
-                        button_value = (function_args.get('value') or '').lower()
-                        # Check if it's a form button that might be hidden by keyboard
-                        form_buttons = ['continue', 'submit', 'login', 'next', 'finish', 'checkout', 'save', 'confirm', 'done']
-                        if any(btn in button_value for btn in form_buttons):
-                            print("--- [KEYBOARD]  Auto-hiding keyboard before clicking button (keyboard may cover button)...")
-                            try:
-                                import appium_tools
-                                hide_result = appium_tools.hide_keyboard()
-                                if isinstance(hide_result, dict) and hide_result.get('success'):
-                                    print("--- [OK] Keyboard hidden successfully")
-                                else:
-                                    print("--- [WARN]  Keyboard hide attempt completed (may not have been visible)")
-                            except Exception as kb_error:
-                                print(f"--- [WARN]  Could not hide keyboard: {kb_error} (continuing anyway)")
+                    button_value = function_args.get('value') or ''
+                    hide_keyboard_if_needed(f"clicking '{button_value}'")
                 
                 # Note: Verification is now only performed when explicitly requested in user prompt
                 # No automatic enforcement - LLM will decide based on user's validation requirements
                 
+                # Check if function is in available_functions, otherwise route to generic dispatcher
                 if function_name in available_functions:
                     # Optionally disable launch_app via env flag
                     disable_launch = os.getenv('DISABLE_LAUNCH_APP', '1').lower() in ('1', 'true', 'yes')
@@ -2464,7 +3403,36 @@ def main(provided_goal: str | None = None):
                                 else:
                                     print("[WARN]  Warning: No session ID available for OCR call")
                             # Retry logic with fallback strategies (max 3 attempts)
-                            result = _execute_with_retry(function_name, function_args, available_functions, expected_inputs)
+                            result = _execute_with_retry(
+                                function_name,
+                                function_args,
+                                available_functions,
+                                expected_inputs,
+                                user_goal=user_goal,
+                                cached_page_config=(_cached_page_config or {}).get('data'),
+                                config_fetcher=fetch_page_config_snapshot
+                            )
+                    elif function_name == 'press_back_button':
+                        allow_back = any(
+                            phrase in user_goal_lower
+                            for phrase in ['back', 'go back', 'previous', 'close', 'dismiss']
+                        ) or getattr(main, '_recent_failure', False)
+                        if not allow_back:
+                            result = {
+                                "success": False,
+                                "error": "Back navigation is blocked unless the user explicitly requests it or you are recovering from a failure. Continue with the remaining steps."
+                            }
+                        else:
+                            result = _execute_with_retry(
+                                function_name,
+                                function_args,
+                                available_functions,
+                                expected_inputs,
+                                smart_executor=smart_executor,
+                                user_goal=user_goal,
+                                cached_page_config=(_cached_page_config or {}).get('data'),
+                                config_fetcher=fetch_page_config_snapshot
+                            )
                     else:
                         # Auto-inject sessionId for OCR assert if missing
                         if function_name == 'wait_for_text_ocr' and isinstance(function_args, dict) and 'sessionId' not in function_args:
@@ -2474,89 +3442,163 @@ def main(provided_goal: str | None = None):
                             else:
                                 print("[WARN]  Warning: No session ID available for OCR call")
                         # Retry logic with fallback strategies (max 3 attempts)
-                        result = _execute_with_retry(function_name, function_args, available_functions, expected_inputs)
+                        result = _execute_with_retry(
+                            function_name,
+                            function_args,
+                            available_functions,
+                            expected_inputs,
+                            smart_executor=smart_executor,
+                            user_goal=user_goal,
+                            cached_page_config=(_cached_page_config or {}).get('data'),
+                            config_fetcher=fetch_page_config_snapshot
+                        )
+                else:
+                    # Tool not in available_functions - route to generic dispatcher
+                    # This allows the LLM to use all 110+ tools from appium-mcp
+                    import appium_tools
+                    if hasattr(appium_tools, 'call_generic_tool'):
+                        print(f"--- [INFO] Routing {function_name} to generic tool dispatcher")
+                        result = appium_tools.call_generic_tool(function_name, **function_args)
+                    else:
+                        result = {"success": False, "error": f"Tool {function_name} not found in available_functions and generic dispatcher not available"}
                     
                     # Check if result indicates an error
                     is_error = False
                     error_message = ""
-                    
-                    # Handle get_page_source returning dict on error
                     if isinstance(result, dict) and result.get('success') is False:
                         is_error = True
                         error_message = result.get('error', 'Unknown error')
-                    elif isinstance(result, str) and result.startswith("Error:"):
-                        is_error = True
-                        error_message = result
-                    elif isinstance(result, dict):
-                        success_value = result.get('success')
-                        
-                        # CRITICAL: send_keys and some tools return success: False when they fail
-                        if (success_value is False or 
-                            success_value == False or 
-                            str(success_value).lower() == 'false'):
-                            is_error = True
-                            if function_name == 'send_keys':
-                                error_message = f"Failed to send text. Element might not be an input field, not editable, or not found. {result.get('error', result.get('message', 'send_keys returned success: false'))}"
-                            else:
-                                error_message = result.get('error', result.get('message', 'Action returned success: false'))
-                        elif 'Error:' in str(result.get('message', '')):
-                            is_error = True
-                            error_message = str(result.get('message', ''))
-                        elif 'Failed' in str(result.get('message', '')) or 'failed' in str(result.get('message', '')):
-                            is_error = True
-                            error_message = str(result.get('message', ''))
                     
-                    # If assertion/verification succeeded, detect page name if it's a page identifier
-                    if function_name == 'wait_for_text_ocr' and isinstance(result, dict) and result.get('success'):
-                        ocr_value = function_args.get('value', '')
-                        detected_page = detect_page_name_from_text(ocr_value)
-                        if detected_page != "Unknown Page":
-                            # Suppress technical message - not shown to users
-                            # print(f"\n[NAV] Page Identified: {detected_page} (via verification text: '{ocr_value}')")
-                            pass
-                    
-                    # Record step in report (mark assertions)
-                    is_assertion = function_name in ('wait_for_element', 'wait_for_text_ocr', 'assert_activity')
-                    test_report.add_step(function_name, function_args, result, not is_error, is_assertion, description=step_description if function_name != 'get_page_source' else None)
-
-                    # Show Pass/Fail status (skip get_page_source as it's internal)
-                    if function_name != 'get_page_source':
-                        if is_error:
-                            print(f"  Result: Fail")
-                        else:
-                            print(f"  Result: Pass")
-
-                    # If action ultimately failed after retries, prepare failure messaging
-                    retry_attempts = None
-                    if isinstance(result, dict):
-                        retry_attempts = result.get('retryAttempts')
+                    # Show Pass/Fail status
                     if is_error:
-                        # Build descriptive failure message
-                        step_label = step_description if function_name != 'get_page_source' else function_name
-                        if step_number > 0 and function_name != 'get_page_source':
-                            if retry_attempts:
-                                failure_text = f"Step {step_number}: {step_label} failed after {retry_attempts} attempts"
-                            else:
-                                failure_text = f"Step {step_number}: {step_label} failed"
-                        else:
-                            if retry_attempts:
-                                failure_text = f"Action '{step_label}' failed after {retry_attempts} attempts"
-                            else:
-                                failure_text = f"Action '{step_label}' failed"
-                        
-                        # Include error details if available
-                        if error_message and failure_text not in error_message:
-                            failure_text = f"{failure_text}. Details: {error_message}"
-                        
-                        print(f"  [ERROR] {failure_text}")
-                        
-                        # Update error message and result metadata so reports reflect the failure
-                        error_message = failure_text
-                        if isinstance(result, dict):
-                            result['failureReason'] = failure_text
+                        print(f"  Result: Fail - {error_message}")
+                    else:
+                        print(f"  Result: Pass")
                     
-                    # CRITICAL: After scroll_to_element succeeds, guide LLM to click the element immediately
-                    if (not is_error and function_name == 'scroll_to_element' and isinstance(result, dict) and result.get('success')):
+                    # Continue to next iteration (skip the rest of the error handling for this tool)
+                    continue
+                
+                # Check if result indicates an error (for tools in available_functions)
+                is_error = False
+                error_message = ""
+                
+                # Handle get_page_source returning dict on error
+                if isinstance(result, dict) and result.get('success') is False:
+                    is_error = True
+                    error_message = result.get('error', 'Unknown error')
+                elif isinstance(result, str) and result.startswith("Error:"):
+                    is_error = True
+                    error_message = result
+                elif isinstance(result, dict):
+                    success_value = result.get('success')
+                    
+                    # CRITICAL: send_keys and some tools return success: False when they fail
+                    if (success_value is False or 
+                        success_value == False or 
+                        str(success_value).lower() == 'false'):
+                        is_error = True
+                        if function_name in ('send_keys', 'ensure_focus_and_type'):
+                            error_msg = result.get('error', result.get('message', 'send_keys returned success: false'))
+                            # Check if this is a container typing issue
+                            value = function_args.get('value', '') if isinstance(function_args, dict) else ''
+                            if value and any(pattern in value.lower() for pattern in ['_chip_group', '_container', '_wrapper', '_layout']):
+                                error_message = f"Failed to send text to container element '{value}'. The element is a container, not an editable field. The system should tap the container first, refresh XML, find the EditText descendant, and retry. {error_msg}"
+                            else:
+                                error_message = f"Failed to send text. Element might not be an input field, not editable, or not found. {error_msg}"
+                        else:
+                            error_message = result.get('error', result.get('message', 'Action returned success: false'))
+                    elif 'Error:' in str(result.get('message', '')):
+                        is_error = True
+                        error_message = str(result.get('message', ''))
+                    elif 'Failed' in str(result.get('message', '')) or 'failed' in str(result.get('message', '')):
+                        is_error = True
+                        error_message = str(result.get('message', ''))
+                
+                # If assertion/verification succeeded, detect page name if it's a page identifier
+                if function_name == 'wait_for_text_ocr' and isinstance(result, dict) and result.get('success'):
+                    ocr_value = function_args.get('value', '')
+                    detected_page = detect_page_name_from_text(ocr_value)
+                    if detected_page != "Unknown Page":
+                        # Suppress technical message - not shown to users
+                        # print(f"\n[NAV] Page Identified: {detected_page} (via verification text: '{ocr_value}')")
+                        pass
+                
+                # Record step in report (mark assertions)
+                is_assertion = function_name in ('wait_for_element', 'wait_for_text_ocr', 'assert_activity')
+                test_report.add_step(function_name, function_args, result, not is_error, is_assertion, description=step_description if function_name != 'get_page_source' else None)
+
+                main._recent_failure = bool(is_error)
+
+                # Show Pass/Fail status (skip get_page_source as it's internal)
+                if function_name != 'get_page_source':
+                    # Format response in Claude Desktop style
+                    if isinstance(result, dict):
+                        # Clean up result for display (remove verbose fields)
+                        display_result = {k: v for k, v in result.items() 
+                                        if k not in ['retryAttempts', 'fallbackUsed', 'method']}
+                        # Truncate very long results
+                        if 'xml' in display_result and len(str(display_result['xml'])) > 500:
+                            display_result['xml'] = str(display_result['xml'])[:500] + "... [truncated]"
+                        print(f"[TOOL_RESPONSE] {json.dumps(display_result, indent=2)}")
+                    else:
+                        print(f"[TOOL_RESPONSE] {json.dumps({'result': str(result)[:500]}, indent=2)}")
+                    
+                    if is_error:
+                        print(f"  Result: Fail")
+                    else:
+                        print(f"  Result: Pass")
+
+                # If action ultimately failed after retries, prepare failure messaging
+                retry_attempts = None
+                if isinstance(result, dict):
+                    retry_attempts = result.get('retryAttempts')
+                if is_error:
+                    # Build descriptive failure message
+                    step_label = step_description if function_name != 'get_page_source' else function_name
+                    if step_number > 0 and function_name != 'get_page_source':
+                        if retry_attempts:
+                            failure_text = f"Step {step_number}: {step_label} failed after {retry_attempts} attempts"
+                        else:
+                            failure_text = f"Step {step_number}: {step_label} failed"
+                    else:
+                        if retry_attempts:
+                            failure_text = f"Action '{step_label}' failed after {retry_attempts} attempts"
+                        else:
+                            failure_text = f"Action '{step_label}' failed"
+                    
+                    # Include error details if available
+                    if error_message and failure_text not in error_message:
+                        failure_text = f"{failure_text}. Details: {error_message}"
+                    
+                    print(f"  [ERROR] {failure_text}")
+                    
+                    # Update error message and result metadata so reports reflect the failure
+                    error_message = failure_text
+                    if isinstance(result, dict):
+                        result['failureReason'] = failure_text
+                    
+                    # If container typing failed, provide specific guidance to LLM
+                    if function_name in ('send_keys', 'ensure_focus_and_type') and isinstance(function_args, dict):
+                        value = function_args.get('value', '')
+                        if value and any(pattern in value.lower() for pattern in ['_chip_group', '_container', '_wrapper', '_layout']):
+                            container_guidance = (
+                                f"CRITICAL: Typing into container element '{value}' failed. "
+                                f"This is a container (ChipGroup, Layout, ViewGroup), not an editable field. "
+                                f"You MUST follow this workflow:\n"
+                                f"1. Tap/click the container element to focus the input area\n"
+                                f"2. Call get_page_source to refresh the XML (the EditText node appears only after tapping)\n"
+                                f"3. Search the NEW XML for an EditText within that container\n"
+                                f"4. Use the resolved EditText locator to type the text\n"
+                                f"5. DO NOT type directly into container elements - they are not editable\n"
+                                f"Retry the action following this workflow."
+                            )
+                            messages.append({
+                                "role": "user",
+                                "content": container_guidance
+                            })
+                    
+                # CRITICAL: After scroll_to_element succeeds, guide LLM to click the element immediately
+                if (not is_error and function_name == 'scroll_to_element' and isinstance(result, dict) and result.get('success')):
                         # Check if we've scrolled to the same element multiple times
                         scroll_value = function_args.get('value', '')
                         if not hasattr(main, '_recent_scrolls'):
@@ -2608,11 +3650,11 @@ def main(provided_goal: str | None = None):
                                 "content": guidance_text
                             })
                     
-                    # Print success message for meaningful actions
-                    if (not is_error and 
-                        function_name != 'get_page_source' and
-                        function_name != 'take_screenshot' and
-                        step_number > 0):
+                # Print success message for meaningful actions
+                if (not is_error and 
+                    function_name != 'get_page_source' and
+                    function_name != 'take_screenshot' and
+                    step_number > 0):
                         # Create user-friendly success message
                         if function_name == 'click':
                             # Try to extract element name from step description
@@ -2646,14 +3688,14 @@ def main(provided_goal: str | None = None):
                             success_msg = "Action completed successfully"
                         print(f"  [SUCCESS] {success_msg}")
                     
-                    # Take screenshot after meaningful successful actions (not internal operations)
-                    # Screenshots are taken after: click, send_keys, wait_for_text_ocr (when successful)
-                    # Skip: get_page_source, wait_for_element (internal), take_screenshot itself
-                    meaningful_actions = ('click', 'send_keys', 'wait_for_text_ocr', 'swipe', 'scroll', 'long_press')
-                    if (not is_error and 
-                        function_name in meaningful_actions and 
-                        function_name != 'get_page_source' and
-                        function_name != 'take_screenshot'):
+                # Take screenshot after meaningful successful actions (not internal operations)
+                # Screenshots are taken after: click, send_keys, wait_for_text_ocr (when successful)
+                # Skip: get_page_source, wait_for_element (internal), take_screenshot itself
+                meaningful_actions = ('click', 'send_keys', 'wait_for_text_ocr', 'swipe', 'scroll', 'long_press')
+                if (not is_error and 
+                    function_name in meaningful_actions and 
+                    function_name != 'get_page_source' and
+                    function_name != 'take_screenshot'):
                         try:
                             # Add delay before taking screenshot to allow screen to stabilize
                             # This ensures screenshots capture the final state, not transition states
@@ -2672,298 +3714,321 @@ def main(provided_goal: str | None = None):
                         except Exception as screenshot_error:
                             # Don't fail the step if screenshot fails
                             print(f"  [WARN] Could not take screenshot: {screenshot_error}")
-                    
-                    # If assertion failed, stop the run immediately
-                    if function_name in ('wait_for_element', 'wait_for_text_ocr', 'assert_activity'):
-                        if isinstance(result, dict) and result.get('success') is False:
-                            # Get page source for verification instead of screenshot
-                            try:
-                                xml_result = get_page_source()
-                                # Handle both string (success) and dict (error) returns
-                                if isinstance(xml_result, dict):
-                                    if xml_result.get('success'):
-                                        current_page_xml = xml_result.get('value', '')
-                                    else:
-                                        current_page_xml = f"[Error getting page source: {xml_result.get('error', 'Unknown error')}]"
+                
+                # If assertion failed, stop the run immediately
+                if function_name in ('wait_for_element', 'wait_for_text_ocr', 'assert_activity'):
+                    if isinstance(result, dict) and result.get('success') is False:
+                        # Get page source for verification instead of screenshot
+                        try:
+                            xml_result = get_page_source_guarded("assertion failure analysis")
+                            # Handle both string (success) and dict (error) returns
+                            if isinstance(xml_result, dict):
+                                if xml_result.get('success'):
+                                    current_page_xml = xml_result.get('value', '')
                                 else:
-                                    current_page_xml = xml_result
-                                # Apply cost optimizations
-                                if USE_XML_COMPRESSION:
-                                    current_page_xml = compress_xml(current_page_xml)
-                                
-                                # Use dynamic XML length based on current message count
-                                dynamic_xml_limit = get_dynamic_xml_length(len(messages) + 1)
-                                truncated_page_xml = truncate_xml(current_page_xml, dynamic_xml_limit)
-                                page_analysis = f"[ERROR] ASSERTION FAILED: Expected '{function_args.get('value', '')}' not found.\n\n📄 Current page source:\n{truncated_page_xml}\n\nAnalyze the page source to determine:\n1. What page/screen is currently visible?\n2. Are there any expected elements or text visible in the XML?\n3. Did the navigation succeed but the element locator is wrong?\n4. Or did the navigation fail completely?\n\nBased on the page source, provide a clear reason for the assertion failure."
-                            except Exception as xml_error:
-                                page_analysis = f"[ERROR] ASSERTION FAILED: Expected element not visible. Page source unavailable: {xml_error}"
-                            
-                            messages.append({
-                                "role": "user",
-                                "content": [
-                                    {"type": "tool_result", "tool_use_id": tool_call_id, "content": json.dumps(result)},
-                                    {"type": "text", "text": page_analysis}
-                                ]
-                            })
-                            try:
-                                if hasattr(main, '_planned_steps') and isinstance(main._planned_steps, list):
-                                    test_report.add_skipped_steps(main._planned_steps, test_report.step_counter + 1)
-                            except Exception:
-                                pass
-                            report_filename = test_report.finalize("error", "Assertion failed: expected element not visible")
-                            print(f"\n[WARN]  Test stopped at Step {step_number}. Subsequent steps will be skipped.")
-                            print(f"[REPORT] Report: {report_filename}")
-                            print(f"[STATS] {test_report.get_summary()}")
-                            print("\n[LIST] Step Summary:")
-                            print(test_report.get_step_summary())
-                            break
-                    
-                    # Mark that screen likely changed - will refresh cache on next loop
-                    _last_action_was_screen_change = True
-                    
-                    # Get new screen XML after action and add to messages for next LLM call
-                    try:
-                        xml_result = get_page_source()
-                        # Handle both string (success) and dict (error) returns
-                        if isinstance(xml_result, dict):
-                            if xml_result.get('success'):
-                                new_screen_xml = xml_result.get('value', '')
+                                    current_page_xml = f"[Error getting page source: {xml_result.get('error', 'Unknown error')}]"
                             else:
-                                new_screen_xml = f"[Error getting page source: {xml_result.get('error', 'Unknown error')}]"
-                        else:
-                            new_screen_xml = xml_result
-                        # Apply cost optimizations
-                        if USE_XML_COMPRESSION:
-                            new_screen_xml = compress_xml(new_screen_xml)
-                        
-                        _cached_xml = new_screen_xml  # Update cache
-                        _cached_xml_timestamp = time.time()
-                        
-                        # Use incremental diff if enabled and we have previous XML
-                        if USE_XML_DIFF and _previous_xml and _previous_xml != new_screen_xml:
-                            diff_xml = get_xml_diff(_previous_xml, new_screen_xml)
-                            dynamic_xml_limit = get_dynamic_xml_length(len(messages) + 1)
-                            truncated_xml = truncate_xml(diff_xml, dynamic_xml_limit)
-                        else:
+                                current_page_xml = xml_result
+                            # Apply cost optimizations
+                            if USE_XML_COMPRESSION:
+                                current_page_xml = compress_xml(current_page_xml)
+                            
                             # Use dynamic XML length based on current message count
                             dynamic_xml_limit = get_dynamic_xml_length(len(messages) + 1)
-                            truncated_xml = truncate_xml(new_screen_xml, dynamic_xml_limit)
+                            truncated_page_xml = truncate_xml(current_page_xml, dynamic_xml_limit)
+                            page_analysis = f"[ERROR] ASSERTION FAILED: Expected '{function_args.get('value', '')}' not found.\n\n📄 Current page source:\n{truncated_page_xml}\n\nAnalyze the page source to determine:\n1. What page/screen is currently visible?\n2. Are there any expected elements or text visible in the XML?\n3. Did the navigation succeed but the element locator is wrong?\n4. Or did the navigation fail completely?\n\nBased on the page source, provide a clear reason for the assertion failure."
+                        except Exception as xml_error:
+                            page_analysis = f"[ERROR] ASSERTION FAILED: Expected element not visible. Page source unavailable: {xml_error}"
                         
-                        # Update previous XML for next diff
-                        _previous_xml = new_screen_xml
-                        
-                        # Add updated page source to messages so LLM sees the new state after action
-                        # This ensures LLM always has the latest screen state
-                        updated_perception = f"[XML Page Source (updated after action)]:\n{truncated_xml}"
                         messages.append({
                             "role": "user",
-                            "content": updated_perception
+                            "content": [
+                                {"type": "tool_result", "tool_use_id": tool_call_id, "content": json.dumps(result)},
+                                {"type": "text", "text": page_analysis}
+                            ]
                         })
-                    except Exception as xml_error:
-                        # If get_page_source fails, use error message as screen state
-                        truncated_xml = f"Error getting page source: {xml_error}"
-                        print(f"[ERROR] Failed to get page source: {xml_error}")
-                    
-                    if is_error:
-                        # REFLECTION MODE: Immediate reflection after any failure
-                        print("\n" + "="*60)
-                        print("[REFLECT] REFLECTION MODE: Analyzing failure...")
-                        print("="*60)
-                        
                         try:
-                            # Get current page source for reflection (fast - XML only)
-                            try:
-                                xml_result = get_page_source()
-                                # Handle both string (success) and dict (error) returns
-                                if isinstance(xml_result, dict):
-                                    if xml_result.get('success'):
-                                        reflection_xml = xml_result.get('value', '')
-                                    else:
-                                        reflection_xml = ''  # Error case, skip text extraction
+                            if hasattr(main, '_planned_steps') and isinstance(main._planned_steps, list):
+                                test_report.add_skipped_steps(main._planned_steps, test_report.step_counter + 1)
+                        except Exception:
+                            pass
+                        finalize_and_generate_report(
+                            test_report,
+                            "error",
+                            "Assertion failed: expected element not visible",
+                            f"Test stopped at Step {step_number}. Subsequent steps were skipped."
+                        )
+                        print("\n[LIST] Step Summary:")
+                        print(test_report.get_step_summary())
+                        break
+                
+                # Mark that screen likely changed - will refresh cache on next loop
+                _last_action_was_screen_change = True
+                
+                # Get fresh perception snapshot after action for next LLM turn
+                try:
+                    if USE_PAGE_CONFIGURATION:
+                        config_result = get_page_configuration_guarded("post-action observation")
+                        summary_text, payload_text, config_data = render_config_state(config_result)
+                        snapshot_payload = payload_text or summary_text
+                        if not summary_text:
+                            summary_text = "[WARN] Page configuration not available."
+                        if not snapshot_payload:
+                            snapshot_payload = summary_text
+                        
+                        _cached_page_config = {"summary": summary_text, "payload": snapshot_payload, "data": config_data}
+                        _cached_page_config_timestamp = time.time()
+                        
+                        dynamic_context_limit = get_dynamic_xml_length(len(messages) + 1)
+                        truncated_summary = truncate_text_block(summary_text, dynamic_context_limit)
+                        truncated_payload = truncate_text_block(snapshot_payload, dynamic_context_limit)
+                        
+                        updated_perception = f"[Page Configuration Summary (updated after action)]:\n{truncated_summary}"
+                        messages.append({
+                            "role": "user",
+                            "content": build_device_context_payload(updated_perception, truncated_payload)
+                        })
+                    else:
+                        xml_result = get_page_source_guarded("post-action observation")
+                        if isinstance(xml_result, dict):
+                            if xml_result.get('success'):
+                                current_screen_xml = xml_result.get('value', '')
+                            else:
+                                current_screen_xml = f"[Error getting page source: {xml_result.get('error', 'Unknown error')}]"
+                        else:
+                            current_screen_xml = xml_result
+                        if USE_XML_COMPRESSION:
+                            current_screen_xml = compress_xml(current_screen_xml)
+                        _cached_xml = current_screen_xml
+                        _cached_xml_timestamp = time.time()
+                        _previous_xml = current_screen_xml
+                        
+                        dynamic_xml_limit = get_dynamic_xml_length(len(messages) + 1)
+                        truncated_current_xml = truncate_xml(current_screen_xml, dynamic_xml_limit)
+                        updated_perception = f"[XML Page Source (updated after action)]:\n{truncated_current_xml}"
+                        messages.append({
+                            "role": "user",
+                            "content": build_device_context_payload(updated_perception, truncated_current_xml)
+                        })
+                except Exception as perception_error:
+                    error_payload = f"Error getting latest screen state: {perception_error}"
+                    print(f"[ERROR] Failed to refresh screen state: {perception_error}")
+                
+                if is_error:
+                    # REFLECTION MODE: Immediate reflection after any failure
+                    print("\n" + "="*60)
+                    print("[REFLECT] REFLECTION MODE: Analyzing failure...")
+                    print("="*60)
+                    
+                    try:
+                        # Get current page source for reflection (fast - XML only)
+                        try:
+                            xml_result = get_page_source_guarded("reflection snapshot")
+                            # Handle both string (success) and dict (error) returns
+                            if isinstance(xml_result, dict):
+                                if xml_result.get('success'):
+                                    reflection_xml = xml_result.get('value', '')
                                 else:
-                                    reflection_xml = xml_result
-                                # Extract text from XML directly (fast)
-                                import re
-                                text_matches = re.findall(r'text="([^"]+)"', reflection_xml) if reflection_xml else []
-                                visible_text = text_matches[:15]  # Limit for speed
-                            except:
-                                visible_text = []
-                            
-                            # Build reflection prompt
-                            reflection_prompt = f"""Action failed: {function_name} with args {function_args}
+                                    reflection_xml = ''  # Error case, skip text extraction
+                            else:
+                                reflection_xml = xml_result
+                            # Extract text from XML directly (fast)
+                            import re
+                            text_matches = re.findall(r'text="([^"]+)"', reflection_xml) if reflection_xml else []
+                            visible_text = text_matches[:15]  # Limit for speed
+                        except:
+                            visible_text = []
+                        
+                        # Build reflection prompt
+                        reflection_prompt = f"""Action failed: {function_name} with args {function_args}
 Observed text on screen: {', '.join(visible_text[:15]) if visible_text else 'No text detected'}
 Expected outcome: {get_verification_requirement(function_name, function_args) if requires_verification(function_name, function_args) else 'Action should have succeeded'}
 Error message: {error_message}
 
 What went wrong? Suggest recovery steps. Provide specific actions to try (e.g., scroll, retry with different selector, check if element is visible)."""
-                            
-                            # Call LLM for reflection
-                            reflection_request = {
-                                "system": "You are a QA testing expert. Analyze test failures and suggest recovery steps.",
-                                "messages": [
-                                    {"role": "user", "content": reflection_prompt}
-                                ],
-                                "anthropic_version": "bedrock-2023-05-31",
-                                "max_tokens": 512
-                            }
-                            
-                            reflection_response = invoke_bedrock_with_retry(
-                                bedrock_client,
-                                reflection_request,
-                                BEDROCK_MODEL_ID,
-                                max_retries=2,
-                                base_delay=0.3  # Optimized: Faster reflection (reduced to 0.3s)
-                            )
-                            
-                            reflection_body = json.loads(reflection_response['body'].read().decode('utf-8'))
-                            reflection_text = next(
-                                (block['text'] for block in reflection_body.get('content', []) if block.get('type') == 'text'),
-                                "Could not generate reflection."
-                            )
-                            
-                            print(f"[INFO] Reflection Analysis:\n{reflection_text}\n")
-                            
-                            # Store reflection in report
-                            if hasattr(test_report, 'add_reflection'):
-                                test_report.add_reflection(step_number, reflection_text)
-                            
-                            # Add reflection to messages with guidance to try different approach
-                            reflection_message = (
-                                f"[REFLECT] REFLECTION MODE:\n{reflection_text}\n\n"
-                                f"[ERROR] Action failed: {function_name} with args {function_args}\n"
-                                f"Error: {error_message}\n\n"
-                                f"Please try a DIFFERENT approach:\n"
-                                f"1. Check the current page source to see what elements are available\n"
-                                f"2. Try alternate selectors (if using 'id', try 'content-desc', 'xpath', or 'text')\n"
-                                f"3. Try finding similar elements (e.g., if 'Add to Cart' not found, look for 'ADD', 'Cart', or product name)\n"
-                                f"4. Verify you're on the correct page/screen - navigate if needed\n"
-                                f"5. Try scrolling manually in different directions\n"
-                                f"6. If element truly doesn't exist, try navigating to a different screen or using alternate paths\n"
-                                f"7. For text input: ensure you're selecting the EditText element, not a container"
-                            )
-                            
-                            messages.append({
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "tool_result",
-                                        "tool_use_id": tool_call_id,
-                                        "content": json.dumps({
-                                            "success": False,
-                                            "error": error_message,
-                                            "reflection": reflection_text,
-                                            "guidance": "Try different selectors or approaches based on reflection analysis"
-                                        })
-                                    },
-                                    {
-                                        "type": "text",
-                                        "text": reflection_message
-                                    }
-                                ]
-                            })
-                            
-                            print("="*60 + "\n")
-                            
-                            # Don't stop immediately - give LLM a chance to try different approach
-                            # Only stop if this is an explicit assertion/verification failure (user requested validation)
-                            if function_name in ('wait_for_element', 'wait_for_text_ocr', 'assert_activity'):
-                                # These are explicit validations - if they fail, user's requirement wasn't met
-                                # Add skipped steps before finalizing
-                                add_skipped_steps_if_needed(test_report, test_report.step_counter)
-                                report_filename = test_report.finalize("error", f"Validation failed: {error_message}")
-                                print(f"\n[WARN]  Test stopped at Step {step_number}. Validation requirement not met.")
-                                print(f"[REPORT] Report: {report_filename}")
-                                print(f"[STATS] {test_report.get_summary()}")
-                                break
-                            else:
-                                # For other actions, continue and let LLM try different approach
-                                print(f"[INFO] Action failed, but continuing to allow LLM to try different approach...")
-                                continue
-                            
-                        except Exception as reflection_error:
-                            print(f"[WARN]  Reflection mode failed: {reflection_error}")
-                            # Continue with standard failure handling - provide guidance
-                            failure_text = (
-                                f"[ERROR] Action failed: {function_name} with args {function_args}\n"
-                                f"Error: {error_message}\n\n"
-                                f"Please try a DIFFERENT approach:\n"
-                                f"1. Check the current page source to see what elements are available\n"
-                                f"2. Try alternate selectors (if using 'id', try 'content-desc', 'xpath', or 'text')\n"
-                                f"3. Try finding similar elements\n"
-                                f"4. Verify you're on the correct page/screen\n"
-                                f"5. Try scrolling manually in different directions"
-                            )
-                            messages.append({
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "tool_result",
-                                        "tool_use_id": tool_call_id,
-                                        "content": json.dumps({
-                                            "success": False,
-                                            "error": error_message,
-                                            "guidance": "Try different selectors or approaches"
-                                        })
-                                    },
-                                    {
-                                        "type": "text",
-                                        "text": failure_text
-                                    }
-                                ]
-                            })
-                            
-                            # Don't stop - give LLM a chance to try different approach
-                            if function_name not in ('wait_for_element', 'wait_for_text_ocr', 'assert_activity'):
-                                print(f"[INFO] Action failed, but continuing to allow LLM to try different approach...")
-                                continue
-                    else:
-                        # Action was successful
-                        is_nav = is_navigation_action(function_name, function_args)
                         
-                        success_text = (
-                            "[OK] Action was successful. Screen updated." if suppress_xml
-                            else f"[OK] Action was successful. Here is the new screen: {truncated_xml}"
+                        # Call LLM for reflection
+                        reflection_request = {
+                            "system": "You are a QA testing expert. Analyze test failures and suggest recovery steps.",
+                            "messages": [
+                                {"role": "user", "content": reflection_prompt}
+                            ],
+                            "anthropic_version": "bedrock-2023-05-31",
+                            "max_tokens": 512
+                        }
+                        
+                        reflection_response = invoke_bedrock_with_retry(
+                            bedrock_client,
+                            reflection_request,
+                            BEDROCK_MODEL_ID,
+                            max_retries=2,
+                            base_delay=0.3  # Optimized: Faster reflection (reduced to 0.3s)
                         )
                         
-                        # Automatically detect page name after navigation actions
-                        # NOTE: This is informational only - LLM will still verify with wait_for_text_ocr
-                        # Suppress all page detection messages - not shown to users
-                        if is_nav and not is_error:
-                            # Suppress all page detection output
-                            # print("\n" + "="*60)
-                            # print("[NAV] AUTOMATIC PAGE DETECTION (Informational)")
-                            # print("="*60)
-                            
-                            page_detection = auto_detect_page_after_navigation(
-                                session_id=main._session_id if hasattr(main, '_session_id') else None
+                        reflection_body = json.loads(reflection_response['body'].read().decode('utf-8'))
+                        reflection_text = next(
+                            (block['text'] for block in reflection_body.get('content', []) if block.get('type') == 'text'),
+                            "Could not generate reflection."
+                        )
+                        
+                        print(f"[INFO] Reflection Analysis:\n{reflection_text}\n")
+                        
+                        # Store reflection in report
+                        if hasattr(test_report, 'add_reflection'):
+                            test_report.add_reflection(step_number, reflection_text)
+                        
+                        # Add reflection to messages with guidance to try different approach
+                        reflection_message = (
+                            f"[REFLECT] REFLECTION MODE:\n{reflection_text}\n\n"
+                            f"[ERROR] Action failed: {function_name} with args {function_args}\n"
+                            f"Error: {error_message}\n\n"
+                            f"Please try a DIFFERENT approach:\n"
+                            f"1. Check the current page source to see what elements are available\n"
+                            f"2. Try alternate selectors (if using 'id', try 'content-desc', 'xpath', or 'text')\n"
+                            f"3. Try finding similar elements (e.g., if 'Add to Cart' not found, look for 'ADD', 'Cart', or product name)\n"
+                            f"4. Verify you're on the correct page/screen - navigate if needed\n"
+                            f"5. Try scrolling manually in different directions\n"
+                            f"6. If element truly doesn't exist, try navigating to a different screen or using alternate paths\n"
+                            f"7. For text input: ensure you're selecting the EditText element, not a container"
+                        )
+                        
+                        messages.append({
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_call_id,
+                                    "content": json.dumps({
+                                        "success": False,
+                                        "error": error_message,
+                                        "reflection": reflection_text,
+                                        "guidance": "Try different selectors or approaches based on reflection analysis"
+                                    })
+                                },
+                                {
+                                    "type": "text",
+                                    "text": reflection_message
+                                }
+                            ]
+                        })
+                        
+                        print("="*60 + "\n")
+                        
+                        # Don't stop immediately - give LLM a chance to try different approach
+                        # Only stop if this is an explicit assertion/verification failure (user requested validation)
+                        if function_name in ('wait_for_element', 'wait_for_text_ocr', 'assert_activity'):
+                            # These are explicit validations - if they fail, user's requirement wasn't met
+                            # Add skipped steps before finalizing
+                            add_skipped_steps_if_needed(test_report, test_report.step_counter)
+                            finalize_and_generate_report(
+                                test_report,
+                                "error",
+                                f"Validation failed: {error_message}",
+                                f"Test stopped at Step {step_number}. Validation requirement not met."
                             )
+                            break
+                        else:
+                            # For other actions, continue and let LLM try different approach
+                            print(f"[INFO] Action failed, but continuing to allow LLM to try different approach...")
+                            continue
                             
-                            # Suppress all page detection messages - not shown to users
-                            # if page_detection['detected']:
-                            #     print(f"[OK] Page Detected: {page_detection['page_name']}")
-                            #     print(f"[LIST] Detected via: {page_detection.get('method', 'Unknown')}")
-                            #     print(f"[CHECK] Identifier: '{page_detection['identifier']}'")
-                            #     print(f"[INFO] Note: LLM will verify with specific page identifier (e.g., 'PRODUCTS', 'CART')")
-                            #     success_text += f"\n[NAV] Page Detected: {page_detection['page_name']} (detected via {page_detection.get('method', 'Unknown')}: '{page_detection['identifier']}')"
-                            # else:
-                            #     print(f"[WARN]  Could not automatically detect page name")
-                            #     print(f"[INFO] Page may still be loading or no prominent text found")
-                            #     success_text += f"\n[WARN]  Page detection: Could not automatically identify page name"
-                            
-                            # print("="*60 + "\n")
-                            pass
+                    except Exception as reflection_error:
+                        print(f"[WARN]  Reflection mode failed: {reflection_error}")
+                        # Continue with standard failure handling - provide guidance
+                        failure_text = (
+                            f"[ERROR] Action failed: {function_name} with args {function_args}\n"
+                            f"Error: {error_message}\n\n"
+                            f"Please try a DIFFERENT approach:\n"
+                            f"1. Check the current page source to see what elements are available\n"
+                            f"2. Try alternate selectors (if using 'id', try 'content-desc', 'xpath', or 'text')\n"
+                            f"3. Try finding similar elements\n"
+                            f"4. Verify you're on the correct page/screen\n"
+                            f"5. Try scrolling manually in different directions"
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_call_id,
+                                    "content": json.dumps({
+                                        "success": False,
+                                        "error": error_message,
+                                        "guidance": "Try different selectors or approaches"
+                                    })
+                                },
+                                {
+                                    "type": "text",
+                                    "text": failure_text
+                                }
+                            ]
+                        })
                         
-                        # Note: Verification is now only performed when explicitly requested in user prompt
-                        # No automatic verification enforcement - LLM will decide based on user's validation requirements
-                        # Clear any old verification flags
-                        main._last_requires_verification = False
-                        main._last_action_type = None
-                        main._last_action_args = None
+                        # Don't stop - give LLM a chance to try different approach
+                        if function_name not in ('wait_for_element', 'wait_for_text_ocr', 'assert_activity'):
+                            print(f"[INFO] Action failed, but continuing to allow LLM to try different approach...")
+                            continue
+                else:
+                    # Action was successful
+                    if function_name in ('send_keys', 'ensure_focus_and_type'):
+                        main._keyboard_visible = True
+                    elif function_name == 'hide_keyboard':
+                        main._keyboard_visible = False
+                    is_nav = is_navigation_action(function_name, function_args)
+                    
+                    if USE_PAGE_CONFIGURATION:
+                        latest_summary = (_cached_page_config or {}).get('summary')
+                        if suppress_page_state or not latest_summary:
+                            success_text = "[OK] Action was successful. Screen updated."
+                        else:
+                            success_text = f"[OK] Action was successful. Here is the new screen:\n{latest_summary}"
+                    else:
+                        latest_xml_view = _cached_xml or ""
+                        if USE_XML_COMPRESSION:
+                            latest_xml_view = compress_xml(latest_xml_view)
+                        truncated_view = truncate_xml(latest_xml_view, get_dynamic_xml_length(len(messages) + 1)) if latest_xml_view else ""
+                        if suppress_page_state or not truncated_view:
+                            success_text = "[OK] Action was successful. Screen updated."
+                        else:
+                            success_text = f"[OK] Action was successful. Here is the new screen:\n{truncated_view}"
+                    
+                    # Automatically detect page name after navigation actions
+                    # NOTE: This is informational only - LLM will still verify with wait_for_text_ocr
+                    # Suppress all page detection messages - not shown to users
+                    if is_nav and not is_error:
+                        # Suppress all page detection output
+                        # print("\n" + "="*60)
+                        # print("[NAV] AUTOMATIC PAGE DETECTION (Informational)")
+                        # print("="*60)
                         
-                        # COMPLETION DETECTION: Check if we've completed all steps
-                        # This detects when we've reached the completion page after FINISH action
-                        # OR when login is complete (screen changes from login to products page)
-                        if (not is_error and 
+                        page_detection = auto_detect_page_after_navigation(
+                            session_id=main._session_id if hasattr(main, '_session_id') else None
+                        )
+                        
+                        # Suppress all page detection messages - not shown to users
+                        # if page_detection['detected']:
+                        #     print(f"[OK] Page Detected: {page_detection['page_name']}")
+                        #     print(f"[LIST] Detected via: {page_detection.get('method', 'Unknown')}")
+                        #     print(f"[CHECK] Identifier: '{page_detection['identifier']}'")
+                        #     print(f"[INFO] Note: LLM will verify with specific page identifier (e.g., 'PRODUCTS', 'CART')")
+                        #     success_text += f"\n[NAV] Page Detected: {page_detection['page_name']} (detected via {page_detection.get('method', 'Unknown')}: '{page_detection['identifier']}')"
+                        # else:
+                        #     print(f"[WARN]  Could not automatically detect page name")
+                        #     print(f"[INFO] Page may still be loading or no prominent text found")
+                        #     success_text += f"\n[WARN]  Page detection: Could not automatically identify page name"
+                        
+                        # print("="*60 + "\n")
+                        pass
+                    
+                    # Note: Verification is now only performed when explicitly requested in user prompt
+                    # No automatic verification enforcement - LLM will decide based on user's validation requirements
+                    # Clear any old verification flags
+                    main._last_requires_verification = False
+                    
+                    # COMPLETION DETECTION: Check if we've completed all steps
+                    # This detects when we've reached the completion page after FINISH action
+                    # OR when login is complete (screen changes from login to products page)
+                    if (not is_error and 
                             function_name == 'click' and 
                             step_description):
                             
@@ -2979,7 +4044,7 @@ What went wrong? Suggest recovery steps. Provide specific actions to try (e.g., 
                                 
                                 # Check if we're on completion page or have successfully logged in
                                 try:
-                                    completion_xml_result = get_page_source()
+                                    completion_xml_result = get_page_source_guarded("completion verification")
                                     completion_xml = None
                                     if isinstance(completion_xml_result, str):
                                         completion_xml = completion_xml_result
@@ -2991,81 +4056,6 @@ What went wrong? Suggest recovery steps. Provide specific actions to try (e.g., 
                                     
                                     login_steps_completed = False
                                     xml_lower = completion_xml.lower() if completion_xml else ""
-                                    
-                                    if is_login_action:
-                                        # Indicators that login was successful (we're no longer on login page)
-                                        login_success_indicators = [
-                                            'products',
-                                            'test-add to cart',
-                                            'test-cart',
-                                            'test-menu',
-                                            'swag labs',
-                                            'inventory',
-                                            'item'
-                                        ]
-                                        # Negative indicators (still on login page)
-                                        login_page_indicators = [
-                                            'test-username',
-                                            'test-password',
-                                            'test-login',
-                                            'username',
-                                            'password',
-                                            'login button'
-                                        ]
-                                        
-                                        has_success_indicator = any(indicator in xml_lower for indicator in login_success_indicators) if xml_lower else False
-                                        still_on_login_page = any(indicator in xml_lower for indicator in login_page_indicators) if xml_lower else False
-                                        
-                                        # Check if all steps from user prompt are complete
-                                        user_prompt_lower = user_goal.lower()
-                                        has_open_app = any(phrase in user_prompt_lower for phrase in ['open', 'launch'])
-                                        has_enter_username = 'username' in user_prompt_lower
-                                        has_enter_password = 'password' in user_prompt_lower
-                                        has_tap_login = 'login' in user_prompt_lower or 'tap' in user_prompt_lower
-                                        
-                                        # Count how many steps we've completed
-                                        completed_steps = []
-                                        for step_info in test_report.report.get('steps', []):
-                                            desc = step_info.get('description', '').lower()
-                                            if 'open' in desc or 'swag labs' in desc:
-                                                completed_steps.append('open')
-                                            if 'username' in desc and ('type' in desc or 'enter' in desc or 'focus' in desc):
-                                                completed_steps.append('username')
-                                            if 'password' in desc and ('type' in desc or 'enter' in desc or 'focus' in desc):
-                                                completed_steps.append('password')
-                                            if 'login' in desc and 'click' in desc:
-                                                completed_steps.append('login')
-                                        
-                                        required_steps = []
-                                        if has_open_app:
-                                            required_steps.append('open')
-                                        if has_enter_username:
-                                            required_steps.append('username')
-                                        if has_enter_password:
-                                            required_steps.append('password')
-                                        if has_tap_login:
-                                            required_steps.append('login')
-                                        
-                                        if required_steps:
-                                            login_steps_completed = all(step in completed_steps for step in required_steps)
-                                        
-                                        if login_steps_completed:
-                                            if still_on_login_page:
-                                                print("[WARN]  Login elements still visible, but all user-requested steps completed. Finalizing per user requirement.")
-                                            elif not has_success_indicator:
-                                                print("[WARN]  Login indicators not found, but all user-requested steps completed. Proceeding to finalize.")
-                                            
-                                            print("\n[INFO]  Completion detected: Login successful and all steps from user prompt completed.")
-                                            print("[INFO]  All steps from user prompt have been completed successfully.")
-                                            print("[INFO]  Stopping automation and generating report...")
-                                            
-                                            # Finalize and save report
-                                            report_filename = test_report.finalize("completed")
-                                            print(f"\n[REPORT] Report: {report_filename}")
-                                            print(f"[STATS] {test_report.get_summary()}")
-                                            
-                                            # Break out of the main loop
-                                            break
                                     
                                     # For finish: Check if we're on completion page
                                     if is_finish_action and completion_xml:
@@ -3080,25 +4070,17 @@ What went wrong? Suggest recovery steps. Provide specific actions to try (e.g., 
                                         is_completion_page = any(indicator in xml_lower for indicator in completion_indicators)
                                         
                                         if is_completion_page:
-                                            print("\n[INFO]  Completion detected: Reached completion page after FINISH action.")
-                                            print("[INFO]  All steps from user prompt have been completed successfully.")
-                                            print("[INFO]  Stopping automation and generating report...")
-                                            
-                                            # Finalize and save report
-                                            report_filename = test_report.finalize("completed")
-                                            print(f"\n[REPORT] Report: {report_filename}")
-                                            print(f"[STATS] {test_report.get_summary()}")
-                                            
+                                            finalize_and_generate_report(
+                                                test_report,
+                                                "completed",
+                                                None,
+                                                "Reached completion page after FINISH action."
+                                            )
                                             # Break out of the main loop
                                             break
                                 except Exception:
-                                    # If completion check fails, fall back to step completion detection
-                                    if is_login_action and login_steps_completed and not still_on_login_page:
-                                        print("\n[WARN]  Completion check failed, but all user steps completed. Finalizing...")
-                                        report_filename = test_report.finalize("completed")
-                                        print(f"\n[REPORT] Report: {report_filename}")
-                                        print(f"[STATS] {test_report.get_summary()}")
-                                        break
+                                    # If completion check fails, continue loop (planned steps logic handles completion)
+                                    pass
                     
                     messages.append({
                         "role": "user",
@@ -3110,21 +4092,50 @@ What went wrong? Suggest recovery steps. Provide specific actions to try (e.g., 
                             },
                             {
                                 "type": "text",
-                                    "text": success_text
+                                "text": success_text
                             }
                         ]
                     })
-                else:
-                    print(f"[ERROR] Error: Unknown function called: {function_name}")
-                    # Add skipped steps before finalizing
-                    add_skipped_steps_if_needed(test_report, test_report.step_counter)
-                    # Save report before breaking
-                    report_filename = test_report.finalize("error", f"Unknown function called: {function_name}")
-                    print(f"\n[REPORT] Report: {report_filename}")
-                    print(f"[STATS] {test_report.get_summary()}")
-                    break
             
             elif stop_reason == "end_turn":
+                # FIX: Track consecutive end_turn responses to prevent infinite loops
+                if not hasattr(main, '_end_turn_count'):
+                    main._end_turn_count = 0
+                main._end_turn_count += 1
+                
+                # Early completion check: If LLM returns end_turn 2+ times, check if goal is complete
+                if main._end_turn_count >= 2:
+                    # Quick goal satisfaction check
+                    user_goal_lower = user_goal.lower()
+                    executed_steps = [s.get('description', '').lower() for s in test_report.report.get('steps', []) if s.get('status') == 'PASS']
+                    
+                    # Check if key actions from goal are satisfied
+                    goal_satisfied = True
+                    if 'open' in user_goal_lower:
+                        app_match = re.search(r'open\s+([a-z0-9 ._-]+)', user_goal, re.IGNORECASE)
+                        if app_match:
+                            app_name = app_match.group(1).lower().strip()
+                            if not any(app_name in desc or desc in app_name for desc in executed_steps):
+                                goal_satisfied = False
+                    
+                    if 'search' in user_goal_lower and goal_satisfied:
+                        if not any('search' in desc for desc in executed_steps):
+                            goal_satisfied = False
+                    
+                    if 'play' in user_goal_lower and goal_satisfied:
+                        if not any('play' in desc or 'video' in desc for desc in executed_steps):
+                            goal_satisfied = False
+                    
+                    # If goal appears satisfied and we have successful steps, stop
+                    if goal_satisfied and len(executed_steps) >= 2:
+                        finalize_and_generate_report(
+                            test_report,
+                            "completed",
+                            None,
+                            f"Goal completed (detected via multiple end_turn: {main._end_turn_count} times)"
+                        )
+                        break
+                
                 # Verify all steps are completed before accepting end_turn
                 # Check if there are planned steps that haven't been executed
                 has_uncompleted_steps = False
@@ -3164,6 +4175,43 @@ What went wrong? Suggest recovery steps. Provide specific actions to try (e.g., 
                 failed_steps = test_report.report.get("failed_steps", 0)
                 
                 if has_uncompleted_steps:
+                    # FIX: Prevent infinite loop - if LLM returns end_turn too many times, force it to use a tool
+                    if main._end_turn_count >= 3:
+                        print(f"\n[WARN]  LLM returned end_turn {main._end_turn_count} times without completing steps. Forcing tool use...")
+                        remaining_steps_text = "\n".join([f"- {desc}" for desc in uncompleted_step_descriptions[:5]])
+                        
+                        # More aggressive guidance - explicitly tell it what tool to use
+                        next_step = uncompleted_step_descriptions[0] if uncompleted_step_descriptions else "next step"
+                        tool_guidance = ""
+                        if "compose" in next_step.lower() or "click" in next_step.lower():
+                            tool_guidance = "Use the 'click' tool to click the Compose button."
+                        elif "email" in next_step.lower() or "to" in next_step.lower():
+                            tool_guidance = "Use 'get_page_configuration' to see the compose screen aliases, then use 'send_keys' or 'ensure_focus_and_type' to enter the email address in the 'To' field."
+                        elif "subject" in next_step.lower():
+                            tool_guidance = "Use 'get_page_configuration' to find the subject field alias, then use 'send_keys' or 'ensure_focus_and_type' to enter the subject."
+                        elif "body" in next_step.lower():
+                            tool_guidance = "Use 'get_page_configuration' to find the body field alias, then use 'send_keys' or 'ensure_focus_and_type' to enter the email body."
+                        elif "send" in next_step.lower():
+                            tool_guidance = "Use 'get_page_configuration' to find the Send button alias, then use 'click' to send the email."
+                        else:
+                            tool_guidance = "Use 'get_page_configuration' to see the current screen aliases, then use 'click' or 'send_keys' to complete the next step."
+                        
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "CRITICAL: You have returned end_turn multiple times without completing the task. "
+                                "You MUST use a tool NOW. Do NOT return end_turn again. "
+                                f"\n\nRemaining steps:\n{remaining_steps_text}\n\n"
+                                f"Next step: {next_step}\n"
+                                f"{tool_guidance}\n\n"
+                                "You MUST call a tool (get_page_configuration, click, send_keys, or ensure_focus_and_type) in your next response. "
+                                "Do NOT return end_turn until ALL steps are complete."
+                            )
+                        })
+                        # Don't reset counter - keep it high to prevent further loops
+                        # Only reset if LLM actually uses a tool (handled in tool_use section)
+                        continue
+                    
                     # Not all steps completed - ask LLM to continue
                     # Suppress technical message - not shown to users (only show user-friendly message)
                     # print(f"\n[WARN]  LLM returned end_turn but not all planned steps have been executed.")
@@ -3184,24 +4232,76 @@ What went wrong? Suggest recovery steps. Provide specific actions to try (e.g., 
                     })
                     # Continue the loop instead of breaking
                     continue
-                elif failed_steps > 0:
+                
+                # Check if LLM returned end_turn multiple times (2-3 times) - might indicate completion
+                # Even if step inference didn't work perfectly, check if goal appears satisfied
+                if hasattr(main, '_end_turn_count') and main._end_turn_count >= 2:
+                    # Goal-based completion check: verify if user's goal keywords are satisfied
+                    user_goal_lower = user_goal.lower()
+                    goal_keywords = []
+                    
+                    # Extract key action verbs and targets from user goal
+                    if 'open' in user_goal_lower:
+                        app_match = re.search(r'open\s+([a-z0-9 ._-]+)', user_goal, re.IGNORECASE)
+                        if app_match:
+                            goal_keywords.append(('open', app_match.group(1).lower().strip()))
+                    
+                    if 'search' in user_goal_lower:
+                        search_match = re.search(r'search\s+for\s+([^,]+?)(?:\s+and\s+then|$)', user_goal, re.IGNORECASE)
+                        if search_match:
+                            goal_keywords.append(('search', search_match.group(1).lower().strip()))
+                    
+                    if 'play' in user_goal_lower:
+                        goal_keywords.append(('play', 'video' if 'video' in user_goal_lower else 'media'))
+                    
+                    # Check executed steps for goal satisfaction
+                    executed_descriptions = [s.get('description', '').lower() for s in test_report.report.get('steps', [])]
+                    goal_satisfied = True
+                    
+                    for action, target in goal_keywords:
+                        found = False
+                        for desc in executed_descriptions:
+                            if action in desc and (target in desc or len(target.split()) == 1 and any(word in desc for word in target.split())):
+                                found = True
+                                break
+                        if not found:
+                            goal_satisfied = False
+                            break
+                    
+                    # If goal appears satisfied and we have at least 2 successful steps, consider it complete
+                    if goal_satisfied and len([s for s in test_report.report.get('steps', []) if s.get('status') == 'PASS']) >= 2:
+                        finalize_and_generate_report(
+                            test_report,
+                            "completed",
+                            None,
+                            f"Goal completed (detected via end_turn: {main._end_turn_count} times and goal satisfaction)"
+                        )
+                        break
+                
+                # Reset counter when steps are actually completed (no uncompleted steps)
+                if hasattr(main, '_end_turn_count'):
+                    main._end_turn_count = 0
+                
+                if failed_steps > 0:
                     # Some steps failed - mark as failed
-                    print("\n[WARN]  Task completed but some steps failed.")
-                    report_filename = test_report.finalize("failed", f"{failed_steps} step(s) failed")
-                    print(f"\n[REPORT] Report: {report_filename}")
-                    print(f"[STATS] {test_report.get_summary()}")
+                    finalize_and_generate_report(
+                        test_report,
+                        "failed",
+                        f"{failed_steps} step(s) failed",
+                        "Task completed but some steps failed."
+                    )
                     break
                 else:
                     # All steps completed successfully
-                    print("\n[OK] Task complete!")
-                    final_text = next((block['text'] for block in response_body.get('content', []) if block['type'] == 'text'), "Done.")
-                    if final_text and final_text != "Done.":
-                        print(final_text)
+                    final_text = next((block['text'] for block in response_body.get('content', []) if block['type'] == 'text'), None)
+                    completion_msg = f"Final message: {final_text}" if final_text and final_text != "Done." else "All steps completed successfully."
                     
-                    # Finalize and save report
-                    report_filename = test_report.finalize("completed")
-                    print(f"\n[REPORT] Report: {report_filename}")
-                    print(f"[STATS] {test_report.get_summary()}")
+                    finalize_and_generate_report(
+                        test_report,
+                        "completed",
+                        None,
+                        completion_msg
+                    )
                     break
             elif stop_reason == "max_tokens":
                 # Response was truncated due to token limit - continue the conversation
@@ -3223,14 +4323,49 @@ What went wrong? Suggest recovery steps. Provide specific actions to try (e.g., 
                 
                 # Continue the loop to get the next response
                 continue
+            elif stop_reason is None or stop_reason == "":
+                # FIX: Handle missing stop_reason - LLM might have returned empty response
+                print(f"\n[WARN]  LLM response missing stop_reason. Content: {response_body.get('content', [])}")
+                
+                # Check if there's any content in the response
+                content = response_body.get('content', [])
+                if content and isinstance(content, list) and len(content) > 0:
+                    # There's content but no stop_reason - might be a text-only response
+                    text_blocks = [b.get('text', '') for b in content if isinstance(b, dict) and b.get('type') == 'text']
+                    if text_blocks:
+                        print(f"[INFO]  LLM returned text response: {text_blocks[0][:100]}...")
+                        # Add the response and ask LLM to use a tool
+                        messages.append({"role": "assistant", "content": content})
+                        messages.append({
+                            "role": "user",
+                            "content": "Please use a tool to continue with the automation. What action should be taken next?"
+                        })
+                        continue
+                
+                # No content or empty response - this is an error
+                print(f"[ERROR] LLM returned empty response or missing stop_reason")
+                # Add skipped steps before finalizing
+                add_skipped_steps_if_needed(test_report, test_report.step_counter)
+                finalize_and_generate_report(
+                    test_report,
+                    "error",
+                    "LLM returned empty response or missing stop_reason",
+                    "Automation stopped due to LLM response error."
+                )
+                break
             else:
                 print(f"[ERROR] Error: Unknown stop reason '{stop_reason}'")
+                # Log full response for debugging
+                print(f"[DEBUG] Full response_body: {json.dumps(response_body, indent=2)[:500]}...")
                 # Add skipped steps before finalizing
                 add_skipped_steps_if_needed(test_report, test_report.step_counter)
                 # Save report before breaking
-                report_filename = test_report.finalize("error", f"Unknown stop reason: {stop_reason}")
-                print(f"\n[REPORT] Report: {report_filename}")
-                print(f"[STATS] {test_report.get_summary()}")
+                finalize_and_generate_report(
+                    test_report,
+                    "error",
+                    f"Unknown stop reason: {stop_reason}",
+                    "Automation stopped due to unknown error."
+                )
                 break
                 
         except KeyboardInterrupt:
@@ -3240,9 +4375,12 @@ What went wrong? Suggest recovery steps. Provide specific actions to try (e.g., 
             try:
                 # Check if report was already finalized (e.g., by signal handler)
                 if test_report.report.get('status') not in ('completed', 'failed', 'cancelled', 'interrupted'):
-                    report_filename = test_report.finalize("interrupted", "User interrupted the execution")
-                    print(f"\n[REPORT] Report: {report_filename}")
-                    print(f"[STATS] {test_report.get_summary()}")
+                    finalize_and_generate_report(
+                        test_report,
+                        "interrupted",
+                        "User interrupted the execution",
+                        "Automation was interrupted by user."
+                    )
             except Exception as save_error:
                 print(f"[WARN]  Warning: Failed to save report: {save_error}")
             raise  # Re-raise KeyboardInterrupt to exit properly
@@ -3252,8 +4390,14 @@ What went wrong? Suggest recovery steps. Provide specific actions to try (e.g., 
             # Show user-friendly error message instead of technical details
             if "Input is too long" in error_message or "too long" in error_message.lower():
                 print(f"\n[ERROR] Automation stopped: The task is too complex. Please try breaking it into smaller steps.")
+            elif "ValidationException" in error_code or "validation" in error_message.lower():
+                # Show ValidationException details - these are usually fixable schema issues
+                print(f"\n[ERROR] Validation error: {error_message}")
+                print(f"[INFO] This is usually caused by an invalid tool schema. Check the error details above.")
             else:
                 print(f"\n[ERROR] Automation encountered an error. Please try again.")
+                # Show error code for debugging (but not full technical details)
+                print(f"[INFO] Error code: {error_code}")
             # Suppress technical details - not shown to users
             # print(f"\n[ERROR] Bedrock API Error ({error_code}): {error_message}")
             
@@ -3271,9 +4415,12 @@ What went wrong? Suggest recovery steps. Provide specific actions to try (e.g., 
             # Add skipped steps before finalizing
             add_skipped_steps_if_needed(test_report, test_report.step_counter)
             # Save report even on error
-            report_filename = test_report.finalize("error", f"{error_code}: {error_message}")
-            print(f"\n[REPORT] Report: {report_filename}")
-            print(f"[STATS] {test_report.get_summary()}")
+            finalize_and_generate_report(
+                test_report,
+                "error",
+                f"{error_code}: {error_message}",
+                "Automation stopped due to API error."
+            )
             break
         except Exception as e:
             print(f"\n[ERROR] Error during Bedrock API call: {type(e).__name__}: {e}")
@@ -3283,14 +4430,20 @@ What went wrong? Suggest recovery steps. Provide specific actions to try (e.g., 
             # If steps failed, mark as failed/error
             if test_report.report.get("failed_steps", 0) == 0:
                 # All steps passed, but exception occurred - mark as completed with warning
-                report_filename = test_report.finalize("completed", None)
-                print(f"\n[WARN]  Exception occurred but all steps passed. Report marked as completed.")
+                finalize_and_generate_report(
+                    test_report,
+                    "completed",
+                    None,
+                    "Exception occurred but all steps passed."
+                )
             else:
                 # Some steps failed - mark as error
-                report_filename = test_report.finalize("error", f"Exception: {type(e).__name__}: {e}")
-            
-            print(f"\n[REPORT] Report: {report_filename}")
-            print(f"[STATS] {test_report.get_summary()}")
+                finalize_and_generate_report(
+                    test_report,
+                    "error",
+                    f"Exception: {type(e).__name__}: {e}",
+                    "Exception occurred during execution."
+                )
             break
 
 

@@ -9,6 +9,8 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 # Load URL from environment, with a default
 # Use 127.0.0.1 instead of localhost for better Windows compatibility
@@ -168,6 +170,551 @@ def get_page_source():
         error_msg = str(e)
         print(f"❌ Error: Failed to get page source: {error_msg}")
         return {"success": False, "error": error_msg}
+
+
+def get_page_configuration(maxElements: int = 60, includeStaticText: bool = False):
+    """
+    Builds a structured JSON page configuration extracted from the current Appium XML.
+
+    Args:
+        maxElements: Maximum number of elements to include in the config (default 60, clamped between 10-150)
+        includeStaticText: If True, include non-interactive text labels in addition to interactive elements
+
+    Returns:
+        dict: {
+            "success": bool,
+            "config": { ... structured data ... }
+        }
+    """
+    print(f"--- [CFG] ACT: Generating page configuration (maxElements={maxElements}, includeStaticText={includeStaticText})")
+
+    xml_result = get_page_source()
+    xml_text = ""
+    if isinstance(xml_result, str):
+        xml_text = xml_result
+    elif isinstance(xml_result, dict):
+        if xml_result.get('success'):
+            xml_text = xml_result.get('value') or xml_result.get('xml') or ""
+        else:
+            return {"success": False, "error": xml_result.get('error', 'Failed to get page source')}
+    else:
+        xml_text = str(xml_result or "")
+
+    if not xml_text.strip():
+        return {"success": False, "error": "Empty page source"}
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as parse_error:
+        return {"success": False, "error": f"XML parse error: {parse_error}"}
+
+    def _to_bool(value) -> bool:
+        if value is None:
+            return False
+        return str(value).strip().lower() in ("true", "1", "yes")
+
+    def _slugify(value: str) -> str:
+        if not value:
+            return ""
+        slug = re.sub(r'[^a-z0-9]+', '_', value.lower()).strip('_')
+        if len(slug) > 64:
+            slug = slug[:64]
+        return slug
+
+    def _parse_bounds(bounds: str) -> Optional[Dict[str, int]]:
+        if not bounds:
+            return None
+        match = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+        if not match:
+            return None
+        x1, y1, x2, y2 = map(int, match.groups())
+        width = max(0, x2 - x1)
+        height = max(0, y2 - y1)
+        return {
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "width": width,
+            "height": height,
+            "center": {"x": x1 + width // 2, "y": y1 + height // 2}
+        }
+
+    parent_map = {}
+    for parent in root.iter():
+        for child in list(parent):
+            parent_map[child] = parent
+
+    container_keywords = ("layout", "viewgroup", "recyclerview", "scrollview", "viewpager", "listview", "coordinatorlayout")
+    alias_counts = {}
+    candidates = []
+    total_elements = 0
+
+    def _build_xpath(element: ET.Element) -> str:
+        segments = []
+        current = element
+        safety_counter = 0
+        while current is not None and safety_counter < 10:
+            parent = parent_map.get(current)
+            class_name = (current.get('class') or current.get('type') or current.tag or 'node')
+            class_name_short = class_name.split('.')[-1]
+            if parent is None:
+                segments.append(f"/{class_name_short}")
+                break
+            siblings = [child for child in list(parent) if (child.get('class') or child.get('type') or child.tag) == (current.get('class') or current.get('type') or current.tag)]
+            try:
+                index = siblings.index(current) + 1
+            except ValueError:
+                index = 1
+            segments.append(f"{class_name_short}[{index}]")
+            current = parent
+            safety_counter += 1
+        segments.reverse()
+        xpath = ''.join(segments)
+        if not xpath.startswith("/"):
+            xpath = "/" + xpath
+        return xpath
+
+    def _summarize_element(element: ET.Element, position: int) -> Optional[Dict]:
+        class_name = element.get('class') or element.get('type') or element.tag or ''
+        class_lower = class_name.lower()
+        text = (element.get('text') or "").strip()
+        label = (element.get('label') or element.get('name') or "").strip()
+        content_desc = (element.get('content-desc') or label).strip()
+        resource_id = (element.get('resource-id') or "").strip()
+        clickable = _to_bool(element.get('clickable'))
+        focusable = _to_bool(element.get('focusable'))
+        
+        # HEURISTIC: Search icons are functionally clickable even if XML doesn't mark them as such
+        # Common search icon patterns: startIcon, searchIcon, search_icon, icon_search, etc.
+        if not clickable:
+            resource_id_lower = resource_id.lower()
+            content_desc_lower = content_desc.lower()
+            search_icon_patterns = ['starticon', 'searchicon', 'search_icon', 'icon_search', 'search_button', 'btn_search']
+            if any(pattern in resource_id_lower for pattern in search_icon_patterns) or \
+               any(pattern in content_desc_lower for pattern in search_icon_patterns):
+                clickable = True  # Search icons are functionally clickable
+        enabled = not element.get('enabled') or _to_bool(element.get('enabled'))
+        checkable = _to_bool(element.get('checkable'))
+        checked = _to_bool(element.get('checked'))
+        visible_attr = element.get('displayed') or element.get('visible')
+        visible = True if visible_attr is None else _to_bool(visible_attr)
+        long_clickable = _to_bool(element.get('long-clickable'))
+        scrollable = _to_bool(element.get('scrollable'))
+        is_editable = _is_editable_element(element)
+        has_text = bool(text or content_desc)
+        has_id = bool(resource_id)
+        is_container = any(keyword in class_lower for keyword in container_keywords)
+        is_interactive = clickable or focusable or is_editable or checkable or long_clickable
+
+        include_element = False
+        if is_editable or checkable:
+            include_element = True
+        elif clickable:
+            include_element = True
+        elif has_id:
+            include_element = True
+        elif has_text and includeStaticText:
+            include_element = True
+
+        if not include_element:
+            return None
+        if is_container and not is_interactive and not (has_text and includeStaticText):
+            return None
+
+        role = "input" if is_editable else \
+            ("toggle" if ("switch" in class_lower or "checkbox" in class_lower or checkable) else
+             ("button" if ("button" in class_lower or clickable) else
+              ("image" if "image" in class_lower else "text")))
+
+        priority = 0
+        if is_editable:
+            priority += 6
+        if clickable:
+            priority += 5
+        if checkable:
+            priority += 4
+        if has_id:
+            priority += 3
+        if has_text:
+            priority += 2
+        if content_desc:
+            priority += 2
+        if focusable:
+            priority += 1
+        if scrollable:
+            priority += 1
+
+        def _alias_source() -> str:
+            if resource_id:
+                return resource_id.split('/')[-1]
+            if content_desc:
+                return content_desc
+            if text:
+                return text
+            if class_name:
+                return class_name.split('.')[-1]
+            return f"element_{position}"
+
+        alias_base = _slugify(_alias_source())
+        if not alias_base:
+            alias_base = f"{role}_{position}"
+        alias_counts.setdefault(alias_base, 0)
+        alias_counts[alias_base] += 1
+        alias = alias_base if alias_counts[alias_base] == 1 else f"{alias_base}_{alias_counts[alias_base]}"
+
+        locators = []
+        if resource_id:
+            locators.append({"strategy": "id", "value": resource_id, "confidence": "high"})
+        if content_desc:
+            locators.append({"strategy": "accessibility_id", "value": content_desc, "confidence": "high" if not resource_id else "medium"})
+        if text:
+            locators.append({"strategy": "text", "value": text, "confidence": "medium"})
+
+        xpath = _build_xpath(element)
+        if xpath:
+            locators.append({"strategy": "xpath", "value": xpath, "confidence": "fallback"})
+
+        primary_locator = locators[0] if locators else None
+        bounds = _parse_bounds(element.get('bounds', ''))
+
+        summary_parts = []
+        if text:
+            summary_parts.append(f"text='{text}'")
+        if content_desc and content_desc != text:
+            summary_parts.append(f"desc='{content_desc}'")
+        if resource_id:
+            summary_parts.append(f"id='{resource_id.split('/')[-1]}'")
+        summary_text = ", ".join(summary_parts) if summary_parts else class_name.split('.')[-1]
+
+        element_summary = {
+            "alias": alias,
+            "role": role,
+            "summary": summary_text,
+            "primaryLocator": primary_locator,
+            "locators": locators,
+            "resourceId": resource_id or None,
+            "text": text or None,
+            "contentDescription": content_desc or None,
+            "className": class_name or None,
+            "xpath": xpath or None,
+            "bounds": bounds,
+            "clickable": clickable,
+            "focusable": focusable,
+            "enabled": enabled,
+            "visible": visible,
+            "isEditable": is_editable,
+            "checkable": checkable,
+            "checked": checked,
+            "longClickable": long_clickable,
+            "scrollable": scrollable,
+            "priority": priority
+        }
+        return element_summary
+
+    for idx, node in enumerate(root.iter()):
+        total_elements += 1
+        candidate = _summarize_element(node, idx)
+        if candidate:
+            candidates.append(candidate)
+
+    if not candidates:
+        return {
+            "success": True,
+            "config": {
+                "metadata": {
+                    "generatedAt": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                    "elementCount": total_elements,
+                    "reportedElements": 0,
+                    "package": None,
+                    "activity": None,
+                    "filters": {
+                        "maxElements": maxElements,
+                        "includeStaticText": includeStaticText
+                    }
+                },
+                "elements": [],
+                "roleIndex": {}
+            }
+        }
+
+    max_elements = max(10, min(int(maxElements or 60), 150))
+    candidates.sort(key=lambda item: item.get('priority', 0), reverse=True)
+    selected = candidates[:max_elements]
+
+    # Remove internal priority field before returning
+    for item in selected:
+        item.pop('priority', None)
+
+    role_index: Dict[str, List[str]] = {}
+    for item in selected:
+        role = item.get('role', 'other')
+        role_index.setdefault(role, []).append(item['alias'])
+
+    package_info = {}
+    try:
+        pkg_result = get_current_package_activity()
+        if isinstance(pkg_result, dict):
+            package_info = pkg_result
+    except Exception:
+        package_info = {}
+
+    package_name = package_info.get('package') or package_info.get('packageName') or package_info.get('currentPackage')
+    activity_name = package_info.get('activity') or package_info.get('activityName') or package_info.get('currentActivity')
+
+    platform_hint = (
+        os.getenv('DEVICE_PLATFORM') or
+        os.getenv('PLATFORM_NAME') or
+        os.getenv('TARGET_PLATFORM') or
+        package_info.get('platform')
+    )
+
+    config = {
+        "metadata": {
+            "generatedAt": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "package": package_name,
+            "activity": activity_name,
+            "platform": platform_hint,
+            "elementCount": total_elements,
+            "reportedElements": len(selected),
+            "filters": {
+                "maxElements": max_elements,
+                "includeStaticText": includeStaticText
+            }
+        },
+        "elements": selected,
+        "roleIndex": role_index
+    }
+
+    return {"success": True, "config": config}
+
+
+# Editable element detection helpers
+ANDROID_EDITABLE_CLASSES = (
+    "edittext",
+    "autocompletetextview",
+    "textinputedittext",
+    "searchautocompletetextview",
+    "multiautocompletetextview",
+    "widget.edittext",
+)
+IOS_EDITABLE_TYPES = (
+    "xcuielementtypetextfield",
+    "xcuielementtypesearchfield",
+    "xcuielementtypetextview",
+    "xcuielementtypesecuretextfield",
+)
+
+
+def _is_editable_element(elem: ET.Element) -> bool:
+    class_attr = (elem.get('class') or elem.get('className') or "").lower()
+    type_attr = (elem.get('type') or "").lower()
+    editable_attr = (elem.get('editable') or elem.get('focusable') or "").lower()
+    if any(keyword in class_attr for keyword in ANDROID_EDITABLE_CLASSES):
+        return True
+    if editable_attr in ("true", "1"):
+        if "textview" in class_attr or "textfield" in type_attr:
+            return True
+    if type_attr and type_attr in IOS_EDITABLE_TYPES:
+        return True
+    return False
+
+
+def _collect_elements_matching_strategy(root: ET.Element, strategy: str, value: str) -> List[ET.Element]:
+    matches = []
+    strategy = (strategy or "").lower()
+    value = value or ""
+    if not value:
+        return matches
+    for elem in root.iter():
+        res_id = elem.get('resource-id') or ""
+        content_desc = elem.get('content-desc') or ""
+        text = elem.get('text') or ""
+        name = elem.get('name') or elem.get('label') or ""
+        if strategy == "id":
+            if res_id == value or res_id.endswith(value.split("/")[-1]):
+                matches.append(elem)
+        elif strategy in ("accessibility_id", "content-desc"):
+            if content_desc == value:
+                matches.append(elem)
+        elif strategy == "text":
+            if text == value:
+                matches.append(elem)
+        elif strategy == "name":
+            if name == value:
+                matches.append(elem)
+    return matches
+
+
+def _build_locator_from_element(elem: ET.Element) -> Tuple[str, str]:
+    res_id = elem.get('resource-id')
+    content_desc = elem.get('content-desc')
+    text = elem.get('text')
+    name = elem.get('name') or elem.get('label')
+    class_name = elem.get('class') or elem.get('type')
+    index = elem.get('index')
+    if res_id:
+        return ("id", res_id)
+    if content_desc:
+        return ("accessibility_id", content_desc)
+    if text:
+        return ("text", text)
+    if name:
+        return ("name", name)
+    if class_name:
+        if index and index.isdigit():
+            return ("xpath", f"(//{class_name})[{int(index) + 1}]")
+        return ("xpath", f"//{class_name}")
+    return ("xpath", "//android.widget.EditText")
+
+
+def resolve_editable_locator(strategy: str, value: str) -> Tuple[str, str]:
+    """
+    If a locator points to a non-editable container, find a descendant/sibling EditText/TextField.
+    Returns possibly updated (strategy, value).
+    
+    Enhanced to handle:
+    - Container patterns (_chip_group, _container, _wrapper, _layout)
+    - Gmail peoplekit patterns
+    - Generic EditText detection
+    - Resource ID pattern matching
+    """
+    try:
+        xml_result = get_page_source()
+        xml_text = ""
+        if isinstance(xml_result, str):
+            xml_text = xml_result
+        elif isinstance(xml_result, dict) and xml_result.get('success'):
+            xml_text = xml_result.get('value', '')
+        if not xml_text:
+            return strategy, value
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return strategy, value
+
+    # Check if target element exists
+    matches = _collect_elements_matching_strategy(root, strategy, value)
+    if not matches:
+        # Element not found - try to find by container pattern matching
+        value_lower = value.lower()
+        container_patterns = ['_chip_group', '_container', '_wrapper', '_layout', '_viewgroup', '_recycler']
+        if any(pattern in value_lower for pattern in container_patterns):
+            # Try to find EditText with similar resource-id pattern
+            base_id = value
+            for pattern in container_patterns:
+                base_id = base_id.replace(pattern, '')
+            # Try common input patterns
+            input_patterns = [
+                f"{base_id}_input",
+                f"{base_id}_text_input",
+                f"{base_id}_edit_text",
+                f"{base_id}_field",
+                f"{base_id}_autocomplete_input",
+                f"{base_id}_input_field",
+                f"{base_id}_textfield",
+                f"{base_id}_compose_text_field"
+            ]
+            for pattern in input_patterns:
+                for elem in root.iter():
+                    res_id = elem.get('resource-id', '')
+                    if pattern.lower() in res_id.lower() and _is_editable_element(elem):
+                        return _build_locator_from_element(elem)
+        return strategy, value
+
+    target_elem = matches[0]
+    
+    # If target is already editable, return as-is
+    if _is_editable_element(target_elem):
+        return strategy, value
+
+    # Strategy 1: Search descendants (most common case)
+    for descendant in target_elem.iter():
+        if descendant is target_elem:
+            continue
+        if _is_editable_element(descendant):
+            resolved = _build_locator_from_element(descendant)
+            print(f"--- [RESOLVE] Found editable descendant: {resolved[0]}={resolved[1]}")
+            return resolved
+
+    # Strategy 2: Search for EditText with similar resource-id pattern
+    res_id = target_elem.get('resource-id', '') or ''
+    if res_id:
+        # Extract base ID (remove container suffixes)
+        base_id = res_id
+        container_suffixes = ['_chip_group', '_container', '_wrapper', '_layout', '_viewgroup', '_recycler', '_search_box']
+        for suffix in container_suffixes:
+            if base_id.endswith(suffix):
+                base_id = base_id[:-len(suffix)]
+                break
+        
+        # Try common input patterns based on base ID
+        input_patterns = [
+            f"{base_id}_input",
+            f"{base_id}_text_input",
+            f"{base_id}_edit_text",
+            f"{base_id}_field",
+            f"{base_id}_autocomplete_input",
+            f"{base_id}_input_field",
+            f"{base_id}_textfield",
+            f"{base_id}_compose_text_field"
+        ]
+        
+        # Also try partial matches
+        if '/' in base_id:
+            id_part = base_id.split('/')[-1]
+            input_patterns.extend([
+                f"{id_part}_input",
+                f"{id_part}_text_input",
+                f"{id_part}_edit_text"
+            ])
+        
+        for pattern in input_patterns:
+            for elem in root.iter():
+                elem_res_id = elem.get('resource-id', '')
+                if pattern.lower() in elem_res_id.lower() and _is_editable_element(elem):
+                    resolved = _build_locator_from_element(elem)
+                    print(f"--- [RESOLVE] Found editable by pattern match: {resolved[0]}={resolved[1]}")
+                    return resolved
+
+    # Strategy 3: Search siblings/nearby elements sharing resource prefix
+    res_prefix = value.split(":")[-1] if ":" in value else value
+    if res_prefix:
+        # Try to find EditText with similar prefix
+        for elem in root.iter():
+            elem_res_id = elem.get('resource-id', '')
+            if res_prefix.lower() in elem_res_id.lower() and _is_editable_element(elem):
+                resolved = _build_locator_from_element(elem)
+                print(f"--- [RESOLVE] Found editable by prefix match: {resolved[0]}={resolved[1]}")
+                return resolved
+
+    # Strategy 4: Search for any visible EditText in the input area (last resort)
+    # Get bounds of target element to find nearby EditText
+    target_bounds = target_elem.get('bounds', '')
+    if target_bounds:
+        # Find EditText elements and check if they're near the target
+        for elem in root.iter():
+            if _is_editable_element(elem):
+                elem_bounds = elem.get('bounds', '')
+                if elem_bounds:
+                    # Simple heuristic: if bounds overlap or are close, use it
+                    resolved = _build_locator_from_element(elem)
+                    print(f"--- [RESOLVE] Found nearby editable: {resolved[0]}={resolved[1]}")
+                    return resolved
+
+    # Strategy 5: Fallback - first visible editable element on screen
+    for elem in root.iter():
+        if _is_editable_element(elem):
+            # Check if visible (has bounds and enabled)
+            bounds = elem.get('bounds', '')
+            enabled = elem.get('enabled', 'true').lower() != 'false'
+            if bounds and enabled:
+                resolved = _build_locator_from_element(elem)
+                print(f"--- [RESOLVE] Found fallback editable: {resolved[0]}={resolved[1]}")
+                return resolved
+
+    # No editable element found - return original
+    print(f"--- [WARN] Could not resolve editable element for {strategy}={value}")
+    return strategy, value
 
 
 def _normalize_for_match(value: str) -> str:
@@ -458,6 +1005,29 @@ def find_edittext_from_container(container_id: str) -> tuple[str, str] | None:
 
 def send_keys(strategy: str, value: str, text: str):
     """Sends text input to a UI element."""
+    # Special handling for "\n" - convert to Enter key event instead of literal text
+    if text == '\\n' or text == '\n' or text == '\\n':
+        print(f"--- ⌨️  ACT: Sending Enter key event (instead of literal '\\n') to element (strategy={strategy}, value={value})")
+        try:
+            # First, ensure the element is focused by clicking it (so Enter key goes to the right field)
+            click_payload = {"tool": "click", "args": {"strategy": strategy, "value": value}}
+            click_response = requests.post(f"{MCP_SERVER_URL}/tools/run", json=click_payload, timeout=30)
+            if click_response.status_code == 200:
+                import time
+                time.sleep(0.2)  # Brief delay for focus
+            
+            # Use send-key-event tool to send Enter key
+            # Use keycode 66 for Android KEYCODE_ENTER (most reliable)
+            payload = {"tool": "send-key-event", "args": {"keycode": 66}}
+            response = requests.post(f"{MCP_SERVER_URL}/tools/run", json=payload, timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            print(f"--- ✅ RESULT: {result}")
+            return result
+        except requests.RequestException as e:
+            print(f"--- ❌ RESULT: {{'success': False, 'error': '{str(e)}'}}")
+            return {"success": False, "error": f"Failed to send Enter key: {str(e)}"}
+    
     # Warn if value looks like a container (common patterns)
     container_patterns = ['_chip_group', '_search_box', '_container', '_wrapper', '_layout']
     is_container = any(pattern in value.lower() for pattern in container_patterns)
@@ -653,12 +1223,14 @@ def ensure_focus_and_type(strategy: str, value: str, text: str, timeoutMs: int =
     
     element_found = False
     working_strategy = strategy
+    working_value = value
     for strat, val in strategies_to_try:
         try:
             wait_res = wait_for_element(strategy=strat, value=val, timeoutMs=timeoutMs)
             if isinstance(wait_res, dict) and wait_res.get('success'):
                 element_found = True
                 working_strategy = strat
+                working_value = val
                 print(f"✅ Element found using strategy '{strat}'")
                 break
         except Exception:
@@ -674,13 +1246,32 @@ def ensure_focus_and_type(strategy: str, value: str, text: str, timeoutMs: int =
         if isinstance(click_res, dict) and click_res.get('success'):
             click_success = True
             working_strategy = strat
+            working_value = val
             break
     
     if not click_success:
         print(f"⚠️  Click failed with initial strategy, trying send_keys anyway")
     
-    # Type the text (this is the critical operation) - use the working strategy
-    type_res = send_keys(strategy=working_strategy, value=value, text=text)
+    # Check if target is a container before typing
+    value_lower = working_value.lower()
+    container_patterns = ['_chip_group', '_container', '_wrapper', '_layout', '_viewgroup', '_recycler', '_search_box']
+    is_container = any(pattern in value_lower for pattern in container_patterns)
+    
+    # If container was clicked, wait a moment for UI to update, then refresh XML
+    if is_container and click_success:
+        print(f"--- [CONTAINER] Detected container element, waiting for UI to update...")
+        time.sleep(0.5)  # Brief wait for UI to update after tap
+    
+    # Resolve actual editable target if needed (especially for containers)
+    resolved_strategy, resolved_value = resolve_editable_locator(working_strategy, working_value)
+    if (resolved_strategy, resolved_value) != (working_strategy, working_value):
+        print(f"--- [SMART] Redirecting text input to editable field via {resolved_strategy}={resolved_value}")
+        # Update working values to use resolved locator
+        working_strategy = resolved_strategy
+        working_value = resolved_value
+    
+    # Type the text (this is the critical operation) - use the resolved strategy/value
+    type_res = send_keys(strategy=working_strategy, value=working_value, text=text)
     
     # Optionally hide keyboard
     if hideKeyboard:
@@ -1112,8 +1703,47 @@ def is_app_installed(bundleId: str):
 
 
 # Export all functions and create the available_functions mapping
+def call_generic_tool(tool_name: str, **kwargs):
+    """
+    Generic tool dispatcher that routes any tool call to the HTTP server.
+    This allows the LLM to use all 110+ tools even if they're not explicitly
+    defined in available_functions.
+    """
+    print(f"--- 🔧 Calling generic tool: {tool_name}")
+    try:
+        # Convert tool name from snake_case to kebab-case for HTTP server
+        # HTTP server accepts both formats, but kebab-case is preferred
+        tool_name_http = tool_name.replace('_', '-')
+        
+        payload = {
+            "tool": tool_name_http,
+            "args": kwargs
+        }
+        
+        response = requests.post(f"{MCP_SERVER_URL}/tools/run", json=payload, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        
+        if result.get('success'):
+            print(f"--- ✅ Tool {tool_name} executed successfully")
+            return result
+        else:
+            error_msg = result.get('error', 'Unknown error')
+            print(f"--- ❌ Tool {tool_name} failed: {error_msg}")
+            return {"success": False, "error": error_msg}
+    except requests.RequestException as e:
+        error_msg = f"Error calling tool {tool_name}: {str(e)}"
+        print(f"--- ❌ {error_msg}")
+        return {"success": False, "error": error_msg}
+    except Exception as e:
+        error_msg = f"Unexpected error calling tool {tool_name}: {str(e)}"
+        print(f"--- ❌ {error_msg}")
+        return {"success": False, "error": error_msg}
+
+
 available_functions = {
     "get_page_source": get_page_source,
+    "get_page_configuration": get_page_configuration,
     "take_screenshot": take_screenshot,
     "get_current_package_activity": get_current_package_activity,
     "click": click,
@@ -1143,6 +1773,7 @@ available_functions = {
     "wait_for_text_ocr": wait_for_text_ocr,
     "ensure_focus_and_type": ensure_focus_and_type,
     "assert_activity": assert_activity,
+    # Note: All other tools (110+ total) are routed via call_generic_tool
 }
 
 

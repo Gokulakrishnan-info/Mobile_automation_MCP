@@ -11,6 +11,7 @@ interface Log {
   type: "success" | "error" | "info" | "action";
   message: string;
   details?: string;
+  tool?: string;
 }
 
 interface LogsPanelProps {
@@ -89,6 +90,7 @@ export const LogsPanel = ({ logs }: LogsPanelProps) => {
                   type={log.type}
                   message={log.message}
                   details={log.details}
+                  tool={log.tool}
                 />
               ))
             )}

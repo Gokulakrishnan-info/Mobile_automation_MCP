@@ -1,6 +1,7 @@
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import { AppiumHelper, AppiumCapabilities } from './lib/appium/appiumHelper.js';
+import { AdbCommands } from './lib/adb/adbCommands.js';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -554,8 +555,147 @@ async function runNamedTool(helper: AppiumHelper, tool: string, args: any): Prom
         return { success: false, error: error.message, result: '', data: '' };
       }
     }
-    default:
-      throw new Error(`Unknown tool: ${tool}`);
+    // Additional tools - try to map to AppiumHelper methods dynamically
+    case 'get-device-time':
+    case 'get_device_time': {
+      const time = await h.getDeviceTime();
+      return { success: true, time, message: `Device time: ${time}` };
+    }
+    case 'pull-file':
+    case 'pull_file': {
+      const fileContent = await h.pullFile(args?.path);
+      return { success: true, data: fileContent, message: `File pulled from ${args?.path}` };
+    }
+    case 'push-file':
+    case 'push_file': {
+      await h.pushFile(args?.path, args?.data);
+      return { success: true, message: `File pushed to ${args?.path}` };
+    }
+    case 'element-exists':
+    case 'element_exists': {
+      const { mappedStrategy, selector } = args?.strategy && args?.value 
+        ? convertStrategyAndValue(args.strategy, args.value)
+        : { mappedStrategy: mapLocatorStrategy(args?.strategy), selector: args?.selector || args?.value };
+      const exists = await h.elementExists(selector, mappedStrategy);
+      return { success: true, exists, message: `Element ${exists ? 'exists' : 'does not exist'}` };
+    }
+    case 'get-element-attributes':
+    case 'get_element_attributes': {
+      const { mappedStrategy, selector } = args?.strategy && args?.value 
+        ? convertStrategyAndValue(args.strategy, args.value)
+        : { mappedStrategy: mapLocatorStrategy(args?.strategy), selector: args?.selector || args?.value };
+      const attributes = await h.getElementAttributes(selector, mappedStrategy);
+      return { success: true, attributes, message: 'Retrieved element attributes' };
+    }
+    case 'scroll-screen':
+    case 'scroll_screen': {
+      const direction = args?.direction || 'down';
+      await h.scrollScreen(direction);
+      return { success: true, message: `Scrolled screen ${direction}` };
+    }
+    case 'shake-device':
+    case 'shake_device': {
+      await h.shakeDevice();
+      return { success: true, message: 'Device shaken' };
+    }
+    case 'is-device-locked':
+    case 'is_device_locked': {
+      const isLocked = await h.isDeviceLocked();
+      return { success: true, isLocked, message: `Device is ${isLocked ? 'locked' : 'unlocked'}` };
+    }
+    case 'get-current-context':
+    case 'get_current_context': {
+      const context = await h.getCurrentContext();
+      return { success: true, context, message: `Current context: ${context}` };
+    }
+    case 'execute-mobile-command':
+    case 'execute_mobile_command': {
+      const result = await h.executeMobileCommand(args?.command, args?.args || []);
+      return { success: true, result, message: 'Mobile command executed' };
+    }
+    case 'perform-w3c-gesture':
+    case 'perform_w3c_gesture': {
+      await h.performW3CGesture(args?.gesture);
+      return { success: true, message: 'W3C gesture performed' };
+    }
+    case 'tap-element':
+    case 'tap_element': {
+      const { mappedStrategy, selector } = args?.strategy && args?.value 
+        ? convertStrategyAndValue(args.strategy, args.value)
+        : { mappedStrategy: mapLocatorStrategy(args?.strategy), selector: args?.selector || args?.value };
+      const success = await h.tapElement(selector, mappedStrategy);
+      return { success, message: success ? 'Element tapped' : 'Failed to tap element' };
+    }
+    case 'send-key-event':
+    case 'send_key_event': {
+      await h.sendKeyEvent(args?.keycode);
+      return { success: true, message: `Key event sent: ${args?.keycode}` };
+    }
+    case 'list-ios-simulators':
+    case 'list_ios_simulators': {
+      const simulators = await h.listIosSimulators();
+      return { success: true, simulators, message: `Found ${simulators.length} simulators` };
+    }
+    
+    // ADB Tools (don't require Appium session)
+    case 'list-devices': {
+      try {
+        const devices = await AdbCommands.getDevices();
+        return { success: true, devices, message: `Found ${devices.length} device(s)` };
+      } catch (error: any) {
+        return { success: false, error: error.message || 'Failed to list devices' };
+      }
+    }
+    case 'install-app': {
+      try {
+        const result = await AdbCommands.installApp(args?.deviceId, args?.apkPath);
+        return { success: true, result, message: 'App installed successfully' };
+      } catch (error: any) {
+        return { success: false, error: error.message || 'Failed to install app' };
+      }
+    }
+    case 'uninstall-app': {
+      try {
+        const result = await AdbCommands.uninstallApp(args?.deviceId, args?.packageName);
+        return { success: true, result, message: 'App uninstalled successfully' };
+      } catch (error: any) {
+        return { success: false, error: error.message || 'Failed to uninstall app' };
+      }
+    }
+    case 'list-installed-packages': {
+      try {
+        const packages = await AdbCommands.getInstalledPackages(args?.deviceId);
+        return { success: true, packages, message: `Found ${packages.length} package(s)` };
+      } catch (error: any) {
+        return { success: false, error: error.message || 'Failed to list packages' };
+      }
+    }
+    case 'execute-adb-command': {
+      try {
+        const result = await AdbCommands.executeCommand(args?.command);
+        return { success: true, result, message: 'ADB command executed' };
+      } catch (error: any) {
+        return { success: false, error: error.message || 'Failed to execute ADB command' };
+      }
+    }
+    
+    // For tools that need special handling or don't map directly, return a helpful error
+    default: {
+      // Try to find if it's a method on AppiumHelper
+      const methodName = tool.replace(/-/g, '').replace(/_/g, '');
+      if (typeof (h as any)[methodName] === 'function') {
+        try {
+          const result = await (h as any)[methodName](...(args ? Object.values(args) : []));
+          return { success: true, result, message: `Executed ${tool}` };
+        } catch (error: any) {
+          return { 
+            success: false, 
+            error: `Error executing ${tool}: ${error instanceof Error ? error.message : String(error)}` 
+          };
+        }
+      }
+      throw new Error(`Unknown tool: ${tool}. Available tools: click, send_keys, get_page_source, take_screenshot, scroll, swipe, long_press, get_element_text, clear_element, press_home_button, press_back_button, launch_app, close_app, reset_app, scroll_to_element, get_orientation, set_orientation, hide_keyboard, lock_device, unlock_device, get_battery_info, get_contexts, switch_context, open_notifications, is_app_installed, get_current_package_activity, get_device_time, pull_file, push_file, element_exists, and more. See /tools/run endpoint documentation.`);
+    }
   }
 }
 

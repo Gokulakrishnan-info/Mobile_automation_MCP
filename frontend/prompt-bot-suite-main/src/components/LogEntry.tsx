@@ -7,9 +7,10 @@ interface LogEntryProps {
   type: "success" | "error" | "info" | "action";
   message: string;
   details?: string;
+  tool?: string;
 }
 
-export const LogEntry = ({ timestamp, type, message, details }: LogEntryProps) => {
+export const LogEntry = ({ timestamp, type, message, details, tool }: LogEntryProps) => {
   const [expanded, setExpanded] = useState(false);
 
   const typeConfig = {
@@ -64,6 +65,102 @@ export const LogEntry = ({ timestamp, type, message, details }: LogEntryProps) =
   };
 
   const formattedMessage = formatMessage(message);
+  
+  // Check if this is a tool call log (Claude Desktop style)
+  const isToolCall = tool || message.startsWith("Calling ");
+  const isRequest = message === "Request" && details;
+  const isResponse = message === "Response" && details;
+  
+  // Try to parse JSON details for pretty formatting
+  let parsedDetails: any = null;
+  if (details) {
+    try {
+      parsedDetails = JSON.parse(details);
+    } catch {
+      // Not JSON, use as-is
+    }
+  }
+
+  // Claude Desktop style: Show tool name prominently for tool calls
+  if (isToolCall) {
+    const toolName = tool || message.replace("Calling ", "").trim();
+    return (
+      <motion.div
+        initial={{ x: 10, opacity: 0 }}
+        animate={{ x: 0, opacity: 1 }}
+        whileHover={{ scale: 1.01, y: -2 }}
+        transition={{ type: "spring", stiffness: 300, damping: 25 }}
+        className={`p-4 rounded-xl ${config.bg} border-2 ${config.border} hover:border-opacity-80 transition-all cursor-default group backdrop-blur-sm shadow-md hover:shadow-lg w-full max-w-full`}
+      >
+        <div className="flex items-center gap-3 mb-2">
+          <motion.div
+            whileHover={{ scale: 1.2, rotate: 5 }}
+            transition={{ duration: 0.2 }}
+            className="flex-shrink-0 p-1.5 rounded-lg bg-background/25 border border-border/30"
+          >
+            <Icon className={`w-5 h-5 ${config.color} drop-shadow-md`} />
+          </motion.div>
+          <span className="text-base font-bold text-foreground font-mono">
+            {toolName}
+          </span>
+          <span className="text-[10px] font-mono font-bold text-muted-foreground/80 whitespace-nowrap flex-shrink-0 px-2 py-1 rounded-lg bg-background/30 border border-border/30 shadow-sm ml-auto">
+            {timestamp}
+          </span>
+        </div>
+        {details && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: expanded ? "auto" : 0, opacity: expanded ? 1 : 0 }}
+            className="overflow-hidden"
+          >
+            <div className="mt-2 space-y-2">
+              {isRequest && (
+                <div className="p-3 bg-background/20 rounded-lg border border-border/40">
+                  <div className="text-xs font-semibold text-muted-foreground mb-2">Request</div>
+                  <pre className="text-xs font-mono text-foreground/90 overflow-x-auto">
+                    {parsedDetails ? JSON.stringify(parsedDetails, null, 2) : details}
+                  </pre>
+                </div>
+              )}
+              {isResponse && (
+                <div className="p-3 bg-background/20 rounded-lg border border-border/40">
+                  <div className="text-xs font-semibold text-muted-foreground mb-2">Response</div>
+                  <pre className="text-xs font-mono text-foreground/90 overflow-x-auto max-h-64 overflow-y-auto">
+                    {parsedDetails ? JSON.stringify(parsedDetails, null, 2) : details}
+                  </pre>
+                </div>
+              )}
+              {!isRequest && !isResponse && details && (
+                <div className="p-3 bg-background/20 rounded-lg border border-border/40">
+                  <pre className="text-xs font-mono text-foreground/90 overflow-x-auto max-h-64 overflow-y-auto">
+                    {parsedDetails ? JSON.stringify(parsedDetails, null, 2) : details}
+                  </pre>
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+        {details && !expanded && (
+          <button
+            onClick={() => setExpanded(true)}
+            className="mt-2 flex items-center gap-2 w-fit text-xs font-bold text-muted-foreground hover:text-foreground transition-all px-3 py-1.5 rounded-lg hover:bg-background/30 border border-border/40 hover:border-primary/40 hover:shadow-md"
+          >
+            <ChevronRight className="w-4 h-4" />
+            Show {isRequest ? "request" : isResponse ? "response" : "details"}
+          </button>
+        )}
+        {expanded && details && (
+          <button
+            onClick={() => setExpanded(false)}
+            className="mt-2 flex items-center gap-2 w-fit text-xs font-bold text-muted-foreground hover:text-foreground transition-all px-3 py-1.5 rounded-lg hover:bg-background/30 border border-border/40 hover:border-primary/40 hover:shadow-md"
+          >
+            <ChevronDown className="w-4 h-4" />
+            Hide details
+          </button>
+        )}
+      </motion.div>
+    );
+  }
 
   return (
     <motion.div
@@ -117,7 +214,7 @@ export const LogEntry = ({ timestamp, type, message, details }: LogEntryProps) =
                   overflowWrap: "break-word",
                 }}
               >
-                {details ?? formattedMessage}
+                {parsedDetails ? JSON.stringify(parsedDetails, null, 2) : (details ?? formattedMessage)}
               </motion.pre>
             )}
 
